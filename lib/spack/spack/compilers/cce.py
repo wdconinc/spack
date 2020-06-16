@@ -86,16 +86,24 @@ class Cce(Compiler):
 
     @property
     def cc_pic_flag(self):
+        if self.version >= ver('9.0'):
+            return '-fPIC'
         return "-h PIC"
 
     @property
     def cxx_pic_flag(self):
+        if self.version >= ver('9.0'):
+            return '-fPIC'
         return "-h PIC"
 
     @property
     def f77_pic_flag(self):
+        if self.version >= ver('9.0'):
+            return '-fPIC'
         return "-h PIC"
 
     @property
     def fc_pic_flag(self):
+        if self.version >= ver('9.0'):
+            return '-fPIC'
         return "-h PIC"
