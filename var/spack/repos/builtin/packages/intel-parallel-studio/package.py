@@ -225,3 +225,7 @@ class IntelParallelStudio(IntelPackage):
             'F90':  spack_fc,
             'FC':   spack_fc,
         })
+
+    def test(self):
+        self.test_compiler()
+        # TODO: test other components
