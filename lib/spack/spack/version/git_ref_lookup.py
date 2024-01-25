@@ -149,11 +149,14 @@ class GitRefLookup(AbstractRefLookup):
             self.fetcher.git("fetch", "--tags", output=os.devnull, error=os.devnull)
 
             # Ensure ref is a commit object known to git
-            # Note the brackets are literals, the ref replaces the format string
+            # Note the brackets in cat-file are literals, the ref replaces the format string
+            fetcher_args = []
+            if ref.startswith("refs/"):
+                fetcher_args.extend(["ls-remote", "--exit-code", "origin", ref])
+            else:
+                fetcher_args.extend(["cat-file", "-e", "%s^{commit}" % ref])
             try:
-                self.fetcher.git(
-                    "cat-file", "-e", "%s^{commit}" % ref, output=os.devnull, error=os.devnull
-                )
+                self.fetcher.git(*fetcher_args, output=os.devnull, error=os.devnull)
             except spack.util.executable.ProcessError:
                 raise VersionLookupError("%s is not a valid git ref for %s" % (ref, self.pkg_name))
 

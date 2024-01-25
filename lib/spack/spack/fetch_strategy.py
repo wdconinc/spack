@@ -714,6 +714,7 @@ class GitFetchStrategy(VCSFetchStrategy):
                       repository's default branch)
         * ``tag``: Particular tag to check out
         * ``commit``: Particular commit hash in the repo
+        * ``ref``: Particular remote ref in the repo, e.g. refs/pull/1/head
 
     Repositories are cloned into the standard stage source path directory.
     """
@@ -723,6 +724,7 @@ class GitFetchStrategy(VCSFetchStrategy):
         "tag",
         "branch",
         "commit",
+        "ref",
         "submodules",
         "get_full_repo",
         "submodules_delete",
@@ -784,7 +786,7 @@ class GitFetchStrategy(VCSFetchStrategy):
         return self.commit or self.tag
 
     def mirror_id(self):
-        repo_ref = self.commit or self.tag or self.branch
+        repo_ref = self.commit or self.tag or self.branch or self.ref
         if repo_ref:
             repo_path = urllib.parse.urlparse(self.url).path
             result = os.path.sep.join(["git", repo_path, repo_ref])
@@ -799,6 +801,8 @@ class GitFetchStrategy(VCSFetchStrategy):
             args = " at tag {0}".format(self.tag)
         elif self.branch:
             args = " on branch {0}".format(self.branch)
+        elif sef.ref:
+            args = " on ref {0}".format(self.ref)
 
         return "{0}{1}".format(self.url, args)
 
@@ -808,9 +812,9 @@ class GitFetchStrategy(VCSFetchStrategy):
             tty.debug("Already fetched {0}".format(self.stage.source_path))
             return
 
-        self.clone(commit=self.commit, branch=self.branch, tag=self.tag)
+        self.clone(commit=self.commit, branch=self.branch, tag=self.tag, ref=self.ref)
 
-    def clone(self, dest=None, commit=None, branch=None, tag=None, bare=False):
+    def clone(self, dest=None, commit=None, branch=None, tag=None, ref=None, bare=False):
         """
         Clone a repository to a path.
 
@@ -823,6 +827,7 @@ class GitFetchStrategy(VCSFetchStrategy):
                 commit, branch, and tag may be non-None.
             branch (str or None): A branch to fetch from the remote.
             tag (str or None): A tag to fetch from the remote.
+            ref (str or None): A ref to fetch from the remote.
             bare (bool): Execute a "bare" git clone (--bare option to git)
         """
         # Default to spack source path
@@ -839,7 +844,7 @@ class GitFetchStrategy(VCSFetchStrategy):
                 clone_args.append("--quiet")
             clone_args.extend([self.url, dest])
             git(*clone_args)
-        elif commit:
+        elif commit or ref:
             # Need to do a regular clone and check out everything if
             # they asked for a particular commit.
             clone_args = ["clone", self.url]
@@ -857,11 +862,22 @@ class GitFetchStrategy(VCSFetchStrategy):
                     onerror=fs.readonly_file_handler(ignore_errors=True),
                 )
 
-            with working_dir(dest):
-                checkout_args = ["checkout", commit]
-                if not debug:
-                    checkout_args.insert(1, "--quiet")
-                git(*checkout_args)
+            if commit:
+                with working_dir(dest):
+                    checkout_args = ["checkout", commit]
+                    if not debug:
+                        checkout_args.insert(1, "--quiet")
+                    git(*checkout_args)
+            elif ref:
+                with working_dir(dest):
+                    fetch_args = ["fetch", "origin", commit]
+                    checkout_args = ["checkout", "FETCH_HEAD"]
+                    if not debug:
+                        fetch_args.insert(1, "--quiet")
+                        checkout_args.insert(1, "--quiet")
+                    git(*fetch_args)
+                    git(*checkout_args)
+
 
         else:
             # Can be more efficient if not checking out a specific commit.
