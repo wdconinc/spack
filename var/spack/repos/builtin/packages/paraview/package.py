@@ -31,7 +31,7 @@ class Paraview(CMakePackage, CudaPackage, ROCmPackage):
 
     version("master", branch="master", submodules=True)
     version(
-        "5.12.0-RC1", sha256="892eda2ae72831bbadd846be465d496ada35739779229c604cddd56e018a1aea"
+        "5.12.0-RC3", sha256="6aaa46ff295126707294482e6ba24bd0ec0d68cf6bb5f56f145f8bcc53fc3f70"
     )
     version(
         "5.11.2",
@@ -537,7 +537,6 @@ class Paraview(CMakePackage, CudaPackage, ROCmPackage):
             cmake_args.extend(
                 [
                     "-DPARAVIEW_%s_PYTHON:BOOL=ON" % py_use_opt,
-                    "-DPYTHON_EXECUTABLE:FILEPATH=%s" % spec["python"].command.path,
                     "-D%s_PYTHON_VERSION:STRING=%d" % (py_ver_opt, py_ver_val),
                 ]
             )
