@@ -997,6 +997,28 @@ def _unknown_variants_in_directives(pkgs, error_cls):
 
 
 @package_directives
+def _multiple_build_systems_without_inheritance(pkgs, error_cls):
+    """Reports missing build_system dependencies.
+
+    When multiple build systems are defined, the package must inherit each of the
+    build system classes.
+    """
+    errors = []
+    for pkg_name in pkgs:
+        pkg_cls = spack.repo.PATH.get_pkg_class(pkg_name)
+
+        if "build_system" in pkg_cls.variant_names():
+            for _, variant in pkg_cls.variant_definitions("build_system"):
+                for build_system in variant.values:
+                    build_system_cls = spack.builder.BUILDER_CLS[str(build_system)]
+                    # if not isinstance(pkg_cls, build_system_cls):
+                    #    msg = f"multi-build system package {pkg_cls.name} does not inherit {build_system_cls}"
+                    #    errors.append(error_cls(msg))
+
+    return spack.llnl.util.lang.dedupe(errors)
+
+
+@package_directives
 def _issues_in_depends_on_directive(pkgs, error_cls):
     """Reports issues with 'depends_on' directives.
 
@@ -1009,18 +1031,19 @@ def _issues_in_depends_on_directive(pkgs, error_cls):
         filename = spack.repo.PATH.filename_for_package_name(pkg_name)
 
         for when, deps_by_name in pkg_cls.dependencies.items():
-            for dep_name, dep in deps_by_name.items():
+            for dep_name, dep_or_list in deps_by_name.items():
+                for dep in spack.dependency.dependencies_as_list(dep_or_list):
 
-                def check_virtual_with_variants(spec, msg):
-                    if not spack.repo.PATH.is_virtual(spec.name) or not spec.variants:
-                        return
-                    error = error_cls(
-                        f"{pkg_name}: {msg}",
-                        [f"remove variants from '{spec}' in depends_on directive in {filename}"],
-                    )
-                    errors.append(error)
+                    def check_virtual_with_variants(spec, msg):
+                        if not spack.repo.PATH.is_virtual(spec.name) or not spec.variants:
+                            return
+                        error = error_cls(
+                            f"{pkg_name}: {msg}",
+                            [f"remove variants from '{spec}' in depends_on directive in {filename}"],
+                        )
+                        errors.append(error)
 
-                check_virtual_with_variants(dep.spec, "virtual dependency cannot have variants")
+                    check_virtual_with_variants(dep.spec, "virtual dependency cannot have variants")
                 check_virtual_with_variants(dep.spec, "virtual when= spec cannot have variants")
 
                 # No need to analyze virtual packages
@@ -1150,13 +1173,14 @@ def _version_constraints_are_satisfiable_by_some_version_in_repo(pkgs, error_cls
         dependencies_to_check = []
 
         for _, deps_by_name in pkg_cls.dependencies.items():
-            for dep_name, dep in deps_by_name.items():
-                # Skip virtual dependencies for the time being, check on
-                # their versions can be added later
-                if spack.repo.PATH.is_virtual(dep_name):
-                    continue
+            for dep_name, dep_or_list in deps_by_name.items():
+                for dep in spack.dependency.dependencies_as_list(dep_or_list):
+                    # Skip virtual dependencies for the time being, check on
+                    # their versions can be added later
+                    if spack.repo.PATH.is_virtual(dep_name):
+                        continue
 
-                dependencies_to_check.append(dep.spec)
+                    dependencies_to_check.append(dep.spec)
 
         host_architecture = spack.spec.ArchSpec.default_arch()
         for s in dependencies_to_check:

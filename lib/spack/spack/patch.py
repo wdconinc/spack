@@ -519,12 +519,13 @@ class PatchCache:
                 index[patch.sha256] = {pkg_class.fullname: patch_dict}
 
         for deps_by_name in pkg_class.dependencies.values():
-            for dependency in deps_by_name.values():
-                for patch_list in dependency.patches.values():
-                    for patch in patch_list:
-                        dspec_cls = repository.get_pkg_class(dependency.spec.name)
-                        patch_dict = patch.to_dict()
-                        patch_dict.pop("sha256")  # save some space
-                        index[patch.sha256] = {dspec_cls.fullname: patch_dict}
+            for dependency_or_list in deps_by_name.values():
+                for dependency in spack.dependency.dependencies_as_list(dependency_or_list):
+                    for patch_list in dependency.patches.values():
+                        for patch in patch_list:
+                            dspec_cls = repository.get_pkg_class(dependency.spec.name)
+                            patch_dict = patch.to_dict()
+                            patch_dict.pop("sha256")  # save some space
+                            index[patch.sha256] = {dspec_cls.fullname: patch_dict}
 
         return index

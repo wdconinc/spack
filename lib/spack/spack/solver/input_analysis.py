@@ -10,6 +10,7 @@ import spack.vendor.archspec.cpu
 import spack.binary_distribution
 import spack.concretize
 import spack.config
+import spack.dependency
 import spack.deptypes as dt
 import spack.platforms
 import spack.repo
@@ -228,10 +229,14 @@ class NoStaticAnalysis(PossibleDependencyGraph):
     def _has_deptypes(self, dependencies, *, allowed_deps: dt.DepFlag, strict: bool) -> bool:
         if strict is True:
             return any(
-                dep.depflag == allowed_deps for deplist in dependencies.values() for dep in deplist
+                dep.depflag == allowed_deps
+                for dep_or_list in dependencies.values()
+                for dep in spack.dependency.dependencies_as_list(dep_or_list)
             )
         return any(
-            dep.depflag & allowed_deps for deplist in dependencies.values() for dep in deplist
+            dep.depflag & allowed_deps
+            for dep_or_list in dependencies.values()
+            for dep in spack.dependency.dependencies_as_list(dep_or_list)
         )
 
     def _is_possible(self, *, pkg_name):

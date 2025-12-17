@@ -35,10 +35,11 @@ def setup_parser(subparser: argparse.ArgumentParser) -> None:
         default=False,
         help="show all transitive dependents",
     )
+    arguments.add_common_arguments(subparser, ["deptype"])
     arguments.add_common_arguments(subparser, ["spec"])
 
 
-def inverted_dependencies():
+def inverted_dependencies(deptype="link"):
     """Iterate through all packages and return a dictionary mapping package
     names to possible dependencies.
 
@@ -48,13 +49,13 @@ def inverted_dependencies():
     """
     dag = collections.defaultdict(set)
     for pkg_cls in spack.repo.PATH.all_package_classes():
-        for _, deps_by_name in pkg_cls.dependencies.items():
-            for dep in deps_by_name:
-                deps = [dep]
+        for spec, deps_by_name in pkg_cls.dependencies.items():
+            for dep_name in deps_by_name:
+                deps = [dep_name]
 
                 # expand virtuals if necessary
-                if spack.repo.PATH.is_virtual(dep):
-                    deps += [s.name for s in spack.repo.PATH.providers_for(dep)]
+                if spack.repo.PATH.is_virtual(dep_name):
+                    deps += [s.name for s in spack.repo.PATH.providers_for(dep_name)]
 
                 for d in deps:
                     dag[d].add(pkg_cls.name)
@@ -96,7 +97,9 @@ def dependents(parser, args):
         format_string = "{name}{@version}{/hash:7}{%compiler}"
         if sys.stdout.isatty():
             tty.msg("Dependents of %s" % spec.cformat(format_string))
-        deps = spack.store.STORE.db.installed_relatives(spec, "parents", args.transitive)
+        deps = spack.store.STORE.db.installed_relatives(
+            spec, "parents", args.transitive, deptype=args.deptype
+        )
         if deps:
             spack.cmd.display_specs(deps, long=True)
         else:
@@ -104,7 +107,7 @@ def dependents(parser, args):
 
     else:
         spec = specs[0]
-        ideps = inverted_dependencies()
+        ideps = inverted_dependencies(deptype=args.deptype)
 
         dependents = get_dependents(spec.name, ideps, args.transitive)
         dependents.remove(spec.name)
