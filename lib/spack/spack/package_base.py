@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Ty
 
 from spack.vendor.typing_extensions import Literal
 
+import spack.builder
 import spack.config
 import spack.dependency
 import spack.deptypes as dt
@@ -316,12 +317,14 @@ def on_package_attributes(**attr_dict):
     def _execute_under_condition(func):
         @functools.wraps(func)
         def _wrapper(instance, *args, **kwargs):
+            pkg = instance.pkg if isinstance(instance, spack.builder.Builder) else instance
+
             # If all the attributes have the value we require, then execute
-            has_all_attributes = all([hasattr(instance, key) for key in attr_dict])
+            has_all_attributes = all([hasattr(pkg, key) for key in attr_dict])
             if has_all_attributes:
                 has_the_right_values = all(
                     [
-                        getattr(instance, key) == value for key, value in attr_dict.items()
+                        getattr(pkg, key) == value for key, value in attr_dict.items()
                     ]  # NOQA: ignore=E501
                 )
                 if has_the_right_values:
@@ -420,9 +423,19 @@ def _by_subkey(
         for key, value in by_key.items():
             if when:
                 when_dict = all_by_subkey.setdefault(key, {})
-                when_dict.setdefault(when_spec, []).append(value)
+                value_list = when_dict.setdefault(when_spec, [])
+                # Handle both single items and lists (lists occur when test/non-test deps are separate)
+                if isinstance(value, list):
+                    value_list.extend(value)
+                else:
+                    value_list.append(value)
             else:
-                all_by_subkey.setdefault(key, []).append(value)
+                value_list = all_by_subkey.setdefault(key, [])
+                # Handle both single items and lists (lists occur when test/non-test deps are separate)
+                if isinstance(value, list):
+                    value_list.extend(value)
+                else:
+                    value_list.append(value)
 
     # this needs to preserve the insertion order of whens
     return dict(sorted(all_by_subkey.items()))
