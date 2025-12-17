@@ -73,3 +73,21 @@ class Dependency:
             return f"<Dependency: {self.pkg.name} -> {self.spec} [{types}, {self.patches}]>"
         else:
             return f"<Dependency: {self.pkg.name} -> {self.spec} [{types}]>"
+
+
+def dependencies_as_list(dep_or_list):
+    """Normalize dependency storage to always return a list.
+    
+    Handles backward compatibility where dependencies can be stored as:
+    - A single Dependency object (old format)
+    - A list of Dependency objects (new format for mixed test/non-test deps)
+    
+    Args:
+        dep_or_list: Either a Dependency object or list of Dependency objects
+        
+    Returns:
+        List of Dependency objects
+    """
+    if isinstance(dep_or_list, list):
+        return dep_or_list
+    return [dep_or_list]
