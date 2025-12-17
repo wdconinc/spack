@@ -150,6 +150,7 @@ def version(
     extension: Optional[str] = None,
     expand: Optional[bool] = None,
     fetch_options: Optional[dict] = None,
+    has_code: Optional[bool] = None,
     # url archive verification options
     md5: Optional[str] = None,
     sha1: Optional[str] = None,
@@ -199,6 +200,7 @@ def version(
             ("extension", extension),
             ("no_cache", no_cache),
             ("fetch_options", fetch_options),
+            ("has_code", has_code),
             ("git", git),
             ("svn", svn),
             ("hg", hg),
@@ -300,7 +302,15 @@ def _depends_on(
 
     # this is where we actually add the dependency to this package
     deps_by_name = pkg.dependencies.setdefault(when_spec, {})
-    dependency = deps_by_name.get(spec.name)
+    
+    # Check if we need to store multiple dependencies for the same package
+    # This happens when mixing test-only and non-test dependencies with different constraints
+    existing_deps = deps_by_name.get(spec.name)
+    
+    # Convert to list format if not already (for backward compatibility)
+    if existing_deps is not None and not isinstance(existing_deps, list):
+        existing_deps = [existing_deps]
+        deps_by_name[spec.name] = existing_deps
 
     edges = spec.edges_to_dependencies()
     if edges and not all(x.direct for x in edges):
@@ -310,14 +320,37 @@ def _depends_on(
             f'\tdepends_on("{spec}", when="{when_spec}")\n'
         )
 
-    if not dependency:
+    if not existing_deps:
+        # First dependency for this package name - store as single object for backward compat
         dependency = Dependency(pkg, spec, depflag=depflag)
         deps_by_name[spec.name] = dependency
     else:
-        copy = dependency.spec.copy()
-        copy.constrain(spec, deps=False)
-        dependency.spec = copy
-        dependency.depflag |= depflag
+        # existing_deps is a list here (converted on line 312 if needed)
+        # Check if we should merge or keep separate
+        new_is_test_only = (depflag == dt.TEST)
+        
+        # Find if we have a mergeable dependency (same test-only status)
+        merged = False
+        for existing_dep in existing_deps:
+            existing_is_test_only = (existing_dep.depflag == dt.TEST)
+            
+            if new_is_test_only == existing_is_test_only:
+                # Merge: both are test-only or both are non-test
+                copy = existing_dep.spec.copy()
+                copy.constrain(spec, deps=False)
+                existing_dep.spec = copy
+                existing_dep.depflag |= depflag
+                dependency = existing_dep
+                merged = True
+                break
+        
+        if not merged:
+            # Different test-only status - keep as separate dependency
+            # Convert to list if not already
+            if not isinstance(deps_by_name[spec.name], list):
+                deps_by_name[spec.name] = existing_deps
+            dependency = Dependency(pkg, spec, depflag=depflag)
+            deps_by_name[spec.name].append(dependency)
 
     # apply patches to the dependency
     for execute_patch in patches:
