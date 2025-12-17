@@ -1451,7 +1451,7 @@ class SpackSolverSetup:
     gen: "ProblemInstanceBuilder"
     possible_versions: Dict[str, Dict[GitOrStandardVersion, List[Provenance]]]
 
-    def __init__(self, tests: spack.concretize.TestsType = False):
+    def __init__(self, tests: spack.concretize.TestsType = False, prefer_older=False):
         self.possible_graph = create_graph_analyzer()
 
         # these are all initialized in setup()
@@ -1492,6 +1492,8 @@ class SpackSolverSetup:
         # whether to add installed/binary hashes to the solve
         self.tests = tests
 
+        self.prefer_older = prefer_older
+
         # If False allows for input specs that are not solved
         self.concretize_everything = True
 
@@ -1517,7 +1519,9 @@ class SpackSolverSetup:
                 self.versions_from_yaml[pkg.name] + ordered_versions
             )
 
-        for weight, declared_version in enumerate(ordered_versions):
+        for weight, declared_version in enumerate(
+            reversed(ordered_versions) if self.prefer_older else ordered_versions
+        ):
             self.gen.fact(fn.pkg_fact(pkg.name, fn.version_declared(declared_version, weight)))
             for origin in version_provenance[declared_version]:
                 self.gen.fact(
@@ -1947,50 +1951,52 @@ class SpackSolverSetup:
         for cond, deps_by_name in pkg.dependencies.items():
             cond_str = str(cond)
             cond_str_suffix = f" when {cond_str}" if cond_str else ""
-            for _, dep in deps_by_name.items():
-                depflag = dep.depflag
-                # Skip test dependencies if they're not requested
-                if not self.tests:
-                    depflag &= ~dt.TEST
+            for _, dep_or_deps in deps_by_name.items():
+                # Handle both single Dependency and list of Dependencies
+                for dep in spack.dependency.dependencies_as_list(dep_or_deps):
+                    depflag = dep.depflag
+                    # Skip test dependencies if they're not requested
+                    if not self.tests:
+                        depflag &= ~dt.TEST
 
-                # ... or if they are requested only for certain packages
-                elif not isinstance(self.tests, bool) and pkg.name not in self.tests:
-                    depflag &= ~dt.TEST
+                    # ... or if they are requested only for certain packages
+                    elif not isinstance(self.tests, bool) and pkg.name not in self.tests:
+                        depflag &= ~dt.TEST
 
-                # if there are no dependency types to be considered
-                # anymore, don't generate the dependency
-                if not depflag:
-                    continue
+                    # if there are no dependency types to be considered
+                    # anymore, don't generate the dependency
+                    if not depflag:
+                        continue
 
-                msg = f"{pkg.name} depends on {dep.spec}{cond_str_suffix}"
+                    msg = f"{pkg.name} depends on {dep.spec}{cond_str_suffix}"
 
-                def dependency_holds(input_spec, requirements):
-                    # TODO: `dependency_holds` is used as a cache key, and is a unique object in
-                    # every iteration of the loop. This prevents deduplication of identical
-                    # "effects" when unique when specs impose the same dependency. We cannot move
-                    # this out of the loop, because the effect cache is keyed only by a spec, and
-                    # not by the dependency type.
-                    result = remove_facts("node", "virtual_node")(input_spec, requirements) + [
-                        fn.attr(
-                            "dependency_holds", pkg.name, input_spec.name, dt.flag_to_string(t)
-                        )
-                        for t in dt.ALL_FLAGS
-                        if t & depflag
-                    ]
-                    if input_spec.name not in pkg.extendees:
-                        return result
-                    return result + [fn.attr("extends", pkg.name, input_spec.name)]
+                    def dependency_holds(input_spec, requirements):
+                        # TODO: `dependency_holds` is used as a cache key, and is a unique object in
+                        # every iteration of the loop. This prevents deduplication of identical
+                        # "effects" when unique when specs impose the same dependency. We cannot move
+                        # this out of the loop, because the effect cache is keyed only by a spec, and
+                        # not by the dependency type.
+                        result = remove_facts("node", "virtual_node")(input_spec, requirements) + [
+                            fn.attr(
+                                "dependency_holds", pkg.name, input_spec.name, dt.flag_to_string(t)
+                            )
+                            for t in dt.ALL_FLAGS
+                            if t & depflag
+                        ]
+                        if input_spec.name not in pkg.extendees:
+                            return result
+                        return result + [fn.attr("extends", pkg.name, input_spec.name)]
 
-                context = ConditionContext()
-                context.source = ConstraintOrigin.append_type_suffix(
-                    pkg.name, ConstraintOrigin.DEPENDS_ON
-                )
-                context.transform_required = _track_dependencies
-                context.transform_imposed = dependency_holds
+                    context = ConditionContext()
+                    context.source = ConstraintOrigin.append_type_suffix(
+                        pkg.name, ConstraintOrigin.DEPENDS_ON
+                    )
+                    context.transform_required = _track_dependencies
+                    context.transform_imposed = dependency_holds
 
-                self.condition(cond, dep.spec, required_name=pkg.name, msg=msg, context=context)
+                    self.condition(cond, dep.spec, required_name=pkg.name, msg=msg, context=context)
 
-                self.gen.newline()
+                    self.gen.newline()
 
     def _gen_match_variant_splice_constraints(
         self,
@@ -3983,6 +3989,8 @@ class Solver:
             packages_with_externals=self.packages_with_externals,
         )
 
+        self.prefer_older = spack.config.get("concretizer:prefer_older", False)
+
     @staticmethod
     def _check_input_and_extract_concrete_specs(
         specs: Sequence[spack.spec.Spec],
@@ -4050,7 +4058,7 @@ class Solver:
         specs = [s.lookup_hash() for s in specs]
         reusable_specs = self._check_input_and_extract_concrete_specs(specs)
         reusable_specs.extend(self.selector.reusable_specs(specs))
-        setup = SpackSolverSetup(tests=tests)
+        setup = SpackSolverSetup(tests=tests, prefer_older=self.prefer_older)
         output = OutputConfiguration(timers=timers, stats=stats, out=out, setup_only=setup_only)
 
         result = self.driver.solve(
@@ -4101,7 +4109,7 @@ class Solver:
         specs = [s.lookup_hash() for s in specs]
         reusable_specs = self._check_input_and_extract_concrete_specs(specs)
         reusable_specs.extend(self.selector.reusable_specs(specs))
-        setup = SpackSolverSetup(tests=tests)
+        setup = SpackSolverSetup(tests=tests, prefer_older=self.prefer_older)
 
         # Tell clingo that we don't have to solve all the inputs at once
         setup.concretize_everything = False
