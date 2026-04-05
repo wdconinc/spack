@@ -1,10 +1,11 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 import pytest
 
+import spack.audit
 from spack.main import SpackCommand
+from spack.test.conftest import MockHTTPResponse
 
 audit = SpackCommand("audit")
 
@@ -34,7 +35,10 @@ def test_audit_configs(mutable_config, mock_packages):
     assert audit.returncode == 1
 
 
-def test_audit_packages_https(mutable_config, mock_packages):
+def test_audit_packages_https(mutable_config, mock_packages, monkeypatch):
+    """Test audit packages-https with mocked network calls."""
+    monkeypatch.setattr(spack.audit, "urlopen", lambda url: MockHTTPResponse(200, "OK"))
+
     # Without providing --all should fail
     audit("packages-https", fail_on_error=False)
     # The mock configuration has duplicate definitions of some compilers

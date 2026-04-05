@@ -1,37 +1,91 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
-import codecs
-import concurrent.futures
 import email.message
 import errno
+import functools
+import io
+import json
 import os
-import os.path
 import re
 import shutil
+import socket
 import ssl
+import stat
 import sys
+import time
 import traceback
 import urllib.parse
 from html.parser import HTMLParser
+from http.client import IncompleteRead
 from pathlib import Path, PurePosixPath
-from typing import IO, Dict, Iterable, List, Optional, Set, Union
+from typing import IO, Callable, Dict, Iterable, List, Optional, Set, Tuple, TypeVar, Union
 from urllib.error import HTTPError, URLError
-from urllib.request import HTTPSHandler, Request, build_opener
+from urllib.request import HTTPDefaultErrorHandler, HTTPSHandler, Request, build_opener
 
-import llnl.url
-from llnl.util import lang, tty
-from llnl.util.filesystem import mkdirp, rename, working_dir
+from spack.vendor.typing_extensions import ParamSpec
 
+import spack
 import spack.config
 import spack.error
+import spack.llnl.url
+import spack.util.executable
+import spack.util.parallel
+import spack.util.path
 import spack.util.url as url_util
+from spack.llnl.util import lang, tty
+from spack.llnl.util.filesystem import mkdirp, rename, working_dir
 
-from .executable import CommandNotFoundError, which
+from .executable import CommandNotFoundError, Executable
 from .gcs import GCSBlob, GCSBucket, GCSHandler
 from .s3 import UrllibS3Handler, get_s3_session
+
+
+def is_transient_error(e: Exception) -> bool:
+    """Return True for HTTP/network errors that are worth retrying."""
+
+    if isinstance(e, HTTPError) and (500 <= e.code < 600 or e.code == 429):
+        return True
+    if isinstance(e, URLError) and isinstance(e.reason, socket.timeout):
+        return True
+    if isinstance(e, (socket.timeout, IncompleteRead)):
+        return True
+    # exceptions not inherited from the above used in urllib3 and botocore.
+    if type(e).__name__ in (
+        "ConnectionClosedError",
+        "IncompleteReadError",
+        "ProtocolError",
+        "ReadTimeoutError",
+        "ResponseStreamingError",
+    ):
+        return True
+    return False
+
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def retry_on_transient_error(
+    f: Callable[_P, _R], retries: int = 5, sleep: Optional[Callable[[float], None]] = None
+) -> Callable[_P, _R]:
+    """Retry a function on transient HTTP/network errors with exponential backoff."""
+    sleep = sleep or time.sleep
+
+    @functools.wraps(f)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        for i in range(retries):
+            try:
+                return f(*args, **kwargs)
+            except Exception as e:
+                if i + 1 != retries and is_transient_error(e):
+                    sleep(2**i)  # type: ignore[misc]  # mypy still thinks it's possibly None.
+                    continue
+                raise
+        raise AssertionError("unreachable")
+
+    return wrapper
 
 
 class DetailedHTTPError(HTTPError):
@@ -54,9 +108,85 @@ class DetailedHTTPError(HTTPError):
         return DetailedHTTPError, (self.req, self.code, self.msg, self.hdrs, None)
 
 
-class SpackHTTPDefaultErrorHandler(urllib.request.HTTPDefaultErrorHandler):
+class DetailedURLError(URLError):
+    def __init__(self, req: Request, reason):
+        super().__init__(reason)
+        self.req = req
+
+    def __str__(self):
+        return f"{self.req.get_method()} {self.req.get_full_url()} errored with: {self.reason}"
+
+    def __reduce__(self):
+        return DetailedURLError, (self.req, self.reason)
+
+
+class SpackHTTPDefaultErrorHandler(HTTPDefaultErrorHandler):
     def http_error_default(self, req, fp, code, msg, hdrs):
         raise DetailedHTTPError(req, code, msg, hdrs, fp)
+
+
+class SpackHTTPSHandler(HTTPSHandler):
+    """A custom HTTPS handler that shows more detailed error messages on connection failure."""
+
+    def https_open(self, req):
+        try:
+            return super().https_open(req)
+        except HTTPError:
+            raise
+        except URLError as e:
+            raise DetailedURLError(req, e.reason) from e
+
+
+def custom_ssl_certs() -> Optional[Tuple[bool, str]]:
+    """Returns a tuple (is_file, path) if custom SSL certifates are configured and valid."""
+    ssl_certs = spack.config.get("config:ssl_certs")
+    if not ssl_certs:
+        return None
+    path = spack.util.path.substitute_path_variables(ssl_certs)
+    if not os.path.isabs(path):
+        tty.debug(f"certs: relative path not allowed: {path}")
+        return None
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        tty.debug(f"certs: error checking path {path}: {e}")
+        return None
+
+    file_type = stat.S_IFMT(st.st_mode)
+
+    if file_type != stat.S_IFREG and file_type != stat.S_IFDIR:
+        tty.debug(f"certs: not a file or directory: {path}")
+        return None
+
+    return (file_type == stat.S_IFREG, path)
+
+
+def ssl_create_default_context():
+    """Create the default SSL context for urllib with custom certificates if configured."""
+    certs = custom_ssl_certs()
+    if certs is None:
+        return ssl.create_default_context()
+    is_file, path = certs
+    if is_file:
+        tty.debug(f"urllib: certs: using cafile {path}")
+        return ssl.create_default_context(cafile=path)
+    else:
+        tty.debug(f"urllib: certs: using capath {path}")
+        return ssl.create_default_context(capath=path)
+
+
+def set_curl_env_for_ssl_certs(curl: Executable) -> None:
+    """configure curl to use custom certs in a file at runtime. See:
+    https://curl.se/docs/sslcerts.html item 4"""
+    certs = custom_ssl_certs()
+    if certs is None:
+        return
+    is_file, path = certs
+    if not is_file:
+        tty.debug(f"curl: {path} is not a file: default certs will be used.")
+        return
+    tty.debug(f"curl: using CURL_CA_BUNDLE={path}")
+    curl.add_default_env("CURL_CA_BUNDLE", path)
 
 
 def _urlopen():
@@ -66,12 +196,12 @@ def _urlopen():
 
     # One opener with HTTPS ssl enabled
     with_ssl = build_opener(
-        s3, gcs, HTTPSHandler(context=ssl.create_default_context()), error_handler
+        s3, gcs, SpackHTTPSHandler(context=ssl_create_default_context()), error_handler
     )
 
     # One opener with HTTPS ssl disabled
     without_ssl = build_opener(
-        s3, gcs, HTTPSHandler(context=ssl._create_unverified_context()), error_handler
+        s3, gcs, SpackHTTPSHandler(context=ssl._create_unverified_context()), error_handler
     )
 
     # And dynamically dispatch based on the config:verify_ssl.
@@ -97,7 +227,8 @@ class HTMLParseError(Exception):
 
 class LinkParser(HTMLParser):
     """This parser just takes an HTML page and strips out the hrefs on the
-    links.  Good enough for a really simple spider."""
+    links, as well as some javascript tags used on GitLab servers.
+    Good enough for a really simple spider."""
 
     def __init__(self):
         super().__init__()
@@ -105,9 +236,18 @@ class LinkParser(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         if tag == "a":
-            for attr, val in attrs:
-                if attr == "href":
-                    self.links.append(val)
+            self.links.extend(val for key, val in attrs if key == "href")
+
+        # GitLab uses a javascript function to place dropdown links:
+        #  <div class="js-source-code-dropdown" ...
+        #   data-download-links="[{"path":"/graphviz/graphviz/-/archive/12.0.0/graphviz-12.0.0.zip",...},...]"/>
+        if tag == "div" and ("class", "js-source-code-dropdown") in attrs:
+            try:
+                links_str = next(val for key, val in attrs if key == "data-download-links")
+                links = json.loads(links_str)
+                self.links.extend(x["path"] for x in links)
+            except Exception:
+                pass
 
 
 class ExtractMetadataParser(HTMLParser):
@@ -143,8 +283,8 @@ def read_from_url(url, accept_content_type=None):
 
     try:
         response = urlopen(request)
-    except URLError as err:
-        raise SpackWebError("Download failed: {}".format(str(err)))
+    except OSError as e:
+        raise SpackWebError(f"Download of {url.geturl()} failed: {e.__class__.__name__}: {e}")
 
     if accept_content_type:
         try:
@@ -161,7 +301,39 @@ def read_from_url(url, accept_content_type=None):
             tty.debug(msg)
             return None, None, None
 
-    return response.geturl(), response.headers, response
+    return response.url, response.headers, response
+
+
+def _read_text(url: str) -> str:
+    request = Request(url, headers={"User-Agent": SPACK_USER_AGENT})
+    with urlopen(request) as response:
+        return io.TextIOWrapper(response, encoding="utf-8").read()
+
+
+def _read_json(url: str):
+    request = Request(url, headers={"User-Agent": SPACK_USER_AGENT})
+    with urlopen(request) as response:
+        return json.load(response)
+
+
+_read_text_with_retry = retry_on_transient_error(_read_text)
+_read_json_with_retry = retry_on_transient_error(_read_json)
+
+
+def read_text(url: str) -> str:
+    """Fetch url and return the response body decoded as UTF-8 text."""
+    try:
+        return _read_text_with_retry(url)
+    except Exception as e:
+        raise SpackWebError(f"Download of {url} failed: {e.__class__.__name__}: {e}")
+
+
+def read_json(url: str):
+    """Fetch url and return the response body parsed as JSON."""
+    try:
+        return _read_json_with_retry(url)
+    except Exception as e:
+        raise SpackWebError(f"Download of {url} failed: {e.__class__.__name__}: {e}")
 
 
 def push_to_url(local_file_path, remote_path, keep_original=True, extra_args=None):
@@ -206,9 +378,7 @@ def push_to_url(local_file_path, remote_path, keep_original=True, extra_args=Non
             os.remove(local_file_path)
 
     else:
-        raise NotImplementedError(
-            "Unrecognized URL scheme: {SCHEME}".format(SCHEME=remote_url.scheme)
-        )
+        raise NotImplementedError(f"Unrecognized URL scheme: {remote_url.scheme}")
 
 
 def base_curl_fetch_args(url, timeout=0):
@@ -221,8 +391,8 @@ def base_curl_fetch_args(url, timeout=0):
     It also uses the following configuration option to set an additional
     argument as needed:
 
-        * config:connect_timeout (int): connection timeout
-        * config:verify_ssl (str): Perform SSL verification
+    * config:connect_timeout (int): connection timeout
+    * config:verify_ssl (str): Perform SSL verification
 
     Arguments:
         url (str): URL whose contents will be fetched
@@ -255,54 +425,54 @@ def base_curl_fetch_args(url, timeout=0):
     return curl_args
 
 
-def check_curl_code(returncode):
+def check_curl_code(returncode: int) -> None:
     """Check standard return code failures for provided arguments.
 
     Arguments:
-        returncode (int): curl return code
+        returncode: curl return code
 
     Raises FetchError if the curl returncode indicates failure
     """
-    if returncode != 0:
-        if returncode == 22:
-            # This is a 404. Curl will print the error.
-            raise spack.error.FetchError("URL was not found!")
+    if returncode == 0:
+        return
+    elif returncode == 22:
+        # This is a 404. Curl will print the error.
+        raise spack.error.FetchError("URL was not found!")
+    elif returncode == 60:
+        # This is a certificate error.  Suggest spack -k
+        raise spack.error.FetchError(
+            "Curl was unable to fetch due to invalid certificate. "
+            "This is either an attack, or your cluster's SSL "
+            "configuration is bad.  If you believe your SSL "
+            "configuration is bad, you can try running spack -k, "
+            "which will not check SSL certificates."
+            "Use this at your own risk."
+        )
 
-        if returncode == 60:
-            # This is a certificate error.  Suggest spack -k
-            raise spack.error.FetchError(
-                "Curl was unable to fetch due to invalid certificate. "
-                "This is either an attack, or your cluster's SSL "
-                "configuration is bad.  If you believe your SSL "
-                "configuration is bad, you can try running spack -k, "
-                "which will not check SSL certificates."
-                "Use this at your own risk."
-            )
-
-        raise spack.error.FetchError("Curl failed with error {0}".format(returncode))
+    raise spack.error.FetchError(f"Curl failed with error {returncode}")
 
 
-def _curl(curl=None):
-    if not curl:
-        try:
-            curl = which("curl", required=True)
-        except CommandNotFoundError as exc:
-            tty.error(str(exc))
-            raise spack.error.FetchError("Missing required curl fetch method")
+def require_curl() -> Executable:
+    try:
+        path = spack.util.executable.which_string("curl", required=True)
+    except CommandNotFoundError as e:
+        raise spack.error.FetchError(f"curl is required but not found: {e}") from e
+    curl = spack.util.executable.Executable(path)
+    set_curl_env_for_ssl_certs(curl)
     return curl
 
 
-def fetch_url_text(url, curl=None, dest_dir="."):
+def fetch_url_text(url, curl: Optional[Executable] = None, dest_dir="."):
     """Retrieves text-only URL content using the configured fetch method.
     It determines the fetch method from:
 
-        * config:url_fetch_method (str): fetch method to use (e.g., 'curl')
+    * config:url_fetch_method (str): fetch method to use (e.g., 'curl')
 
-    If the method is `curl`, it also uses the following configuration
+    If the method is ``curl``, it also uses the following configuration
     options:
 
-        * config:connect_timeout (int): connection time out
-        * config:verify_ssl (str): Perform SSL verification
+    * config:connect_timeout (int): connection time out
+    * config:verify_ssl (str): Perform SSL verification
 
     Arguments:
         url (str): URL whose contents are to be fetched
@@ -325,12 +495,9 @@ def fetch_url_text(url, curl=None, dest_dir="."):
 
     fetch_method = spack.config.get("config:url_fetch_method")
     tty.debug("Using '{0}' to fetch {1} into {2}".format(fetch_method, url, path))
-    if fetch_method == "curl":
-        curl_exe = _curl(curl)
-        if not curl_exe:
-            raise spack.error.FetchError("Missing required fetch method (curl)")
-
-        curl_args = ["-O"]
+    if fetch_method and fetch_method.startswith("curl"):
+        curl_exe = curl or require_curl()
+        curl_args = fetch_method.split()[1:] + ["-O"]
         curl_args.extend(base_curl_fetch_args(url))
 
         # Curl automatically downloads file contents as filename
@@ -342,34 +509,37 @@ def fetch_url_text(url, curl=None, dest_dir="."):
 
     else:
         try:
-            _, _, response = read_from_url(url)
-
-            returncode = response.getcode()
-            if returncode and returncode != 200:
-                raise spack.error.FetchError(
-                    "Urllib failed with error code {0}".format(returncode)
-                )
-
-            output = codecs.getreader("utf-8")(response).read()
+            output = read_text(url)
             if output:
                 with working_dir(dest_dir, create=True):
-                    with open(filename, "w") as f:
+                    with open(filename, "w", encoding="utf-8") as f:
                         f.write(output)
 
                 return path
 
-        except SpackWebError as err:
-            raise spack.error.FetchError("Urllib fetch failed to verify url: {0}".format(str(err)))
+        except (SpackWebError, OSError, ValueError) as err:
+            raise spack.error.FetchError(f"Urllib fetch failed: {err}")
 
     return None
+
+
+def _url_exists_urllib_impl(url):
+    with urlopen(
+        Request(url, method="HEAD", headers={"User-Agent": SPACK_USER_AGENT}),
+        timeout=spack.config.get("config:connect_timeout", 10),
+    ) as _:
+        pass
+
+
+_url_exists_urllib = retry_on_transient_error(_url_exists_urllib_impl)
 
 
 def url_exists(url, curl=None):
     """Determines whether url exists.
 
-    A scheme-specific process is used for Google Storage (`gs`) and Amazon
-    Simple Storage Service (`s3`) URLs; otherwise, the configured fetch
-    method defined by `config:url_fetch_method` is used.
+    A scheme-specific process is used for Google Storage (``gs``) and Amazon
+    Simple Storage Service (``s3``) URLs; otherwise, the configured fetch
+    method defined by ``config:url_fetch_method`` is used.
 
     Arguments:
         url (str): URL whose existence is being checked
@@ -382,17 +552,14 @@ def url_exists(url, curl=None):
     url_result = urllib.parse.urlparse(url)
 
     # Use curl if configured to do so
-    use_curl = spack.config.get(
-        "config:url_fetch_method", "urllib"
-    ) == "curl" and url_result.scheme not in ("gs", "s3")
+    fetch_method = spack.config.get("config:url_fetch_method", "urllib")
+    use_curl = fetch_method.startswith("curl") and url_result.scheme not in ("gs", "s3")
     if use_curl:
-        curl_exe = _curl(curl)
-        if not curl_exe:
-            return False
+        curl_exe = curl or require_curl()
 
         # Telling curl to fetch the first byte (-r 0-0) is supposed to be
         # portable.
-        curl_args = ["--stderr", "-", "-s", "-f", "-r", "0-0", url]
+        curl_args = fetch_method.split()[1:] + ["--stderr", "-", "-s", "-f", "-r", "0-0", url]
         if not spack.config.get("config:verify_ssl"):
             curl_args.append("-k")
         _ = curl_exe(*curl_args, fail_on_error=False, output=os.devnull)
@@ -400,13 +567,10 @@ def url_exists(url, curl=None):
 
     # Otherwise use urllib.
     try:
-        urlopen(
-            Request(url, method="HEAD", headers={"User-Agent": SPACK_USER_AGENT}),
-            timeout=spack.config.get("config:connect_timeout", 10),
-        )
+        _url_exists_urllib(url)
         return True
-    except URLError as e:
-        tty.debug("Failure reading URL: " + str(e))
+    except Exception as e:
+        tty.debug(f"Failure reading {url}: {e}")
         return False
 
 
@@ -535,7 +699,7 @@ def list_url(url, recursive=False):
     if local_path:
         if recursive:
             # convert backslash to forward slash as required for URLs
-            return [str(PurePosixPath(Path(p))) for p in list(_iter_local_prefix(local_path))]
+            return [str(PurePosixPath(Path(p))) for p in _iter_local_prefix(local_path)]
         return [
             subpath
             for subpath in os.listdir(local_path)
@@ -552,6 +716,46 @@ def list_url(url, recursive=False):
     elif url.scheme == "gs":
         gcs = GCSBucket(url)
         return gcs.get_all_blobs(recursive=recursive)
+
+
+def stat_url(url: str) -> Optional[Tuple[int, float]]:
+    """Get stat result for a URL.
+
+    Args:
+        url: URL to get stat result for
+    Returns:
+        A tuple of (size, mtime) if the URL exists, None otherwise.
+    """
+    parsed_url = urllib.parse.urlparse(url)
+
+    if parsed_url.scheme == "file":
+        local_file_path = url_util.local_file_path(parsed_url)
+        assert isinstance(local_file_path, str)
+        try:
+            url_stat = Path(local_file_path).stat()
+        except FileNotFoundError:
+            return None
+        return url_stat.st_size, url_stat.st_mtime
+
+    elif parsed_url.scheme == "s3":
+        s3_bucket = parsed_url.netloc
+        s3_key = parsed_url.path.lstrip("/")
+
+        s3 = get_s3_session(url, method="fetch")
+
+        try:
+            head_request = s3.head_object(Bucket=s3_bucket, Key=s3_key)
+        except s3.ClientError as e:
+            if e.response["Error"]["Code"] == "404":
+                return None
+            raise e
+
+        mtime = head_request["LastModified"].timestamp()
+        size = head_request["ContentLength"]
+        return size, mtime
+
+    else:
+        raise NotImplementedError(f"Unrecognized URL scheme: {parsed_url.scheme}")
 
 
 def spider(
@@ -582,7 +786,7 @@ def spider(
         root = urllib.parse.urlparse(root_str)
         spider_args.append((root, go_deeper, _visited))
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=concurrency) as tp:
+    with spack.util.parallel.make_concurrent_executor(concurrency, require_fork=False) as tp:
         while current_depth <= depth:
             tty.debug(
                 f"SPIDER: [depth={current_depth}, max_depth={depth}, urls={len(spider_args)}]"
@@ -631,7 +835,8 @@ def _spider(url: urllib.parse.ParseResult, collect_nested: bool, _visited: Set[s
         if not response_url or not response:
             return pages, links, subcalls, _visited
 
-        page = codecs.getreader("utf-8")(response).read()
+        with response:
+            page = io.TextIOWrapper(response, encoding="utf-8").read()
         pages[response_url] = page
 
         # Parse out the include-fragments in the page
@@ -647,6 +852,7 @@ def _spider(url: urllib.parse.ParseResult, collect_nested: bool, _visited: Set[s
             raw_link = metadata_parser.fragments.pop()
             abs_link = url_util.join(response_url, raw_link.strip(), resolve_href=True)
 
+            fragment_response_url = None
             try:
                 # This seems to be text/html, though text/fragment+html is also used
                 fragment_response_url, _, fragment_response = read_from_url(abs_link, "text/html")
@@ -657,7 +863,8 @@ def _spider(url: urllib.parse.ParseResult, collect_nested: bool, _visited: Set[s
             if not fragment_response_url or not fragment_response:
                 continue
 
-            fragment = codecs.getreader("utf-8")(fragment_response).read()
+            with fragment_response:
+                fragment = io.TextIOWrapper(fragment_response, encoding="utf-8").read()
             fragments.add(fragment)
 
             pages[fragment_response_url] = fragment
@@ -674,7 +881,7 @@ def _spider(url: urllib.parse.ParseResult, collect_nested: bool, _visited: Set[s
             links.add(abs_link)
 
             # Skip stuff that looks like an archive
-            if any(raw_link.endswith(s) for s in llnl.url.ALLOWED_ARCHIVE_TYPES):
+            if any(raw_link.endswith(s) for s in spack.llnl.url.ALLOWED_ARCHIVE_TYPES):
                 continue
 
             # Skip already-visited links
@@ -686,10 +893,10 @@ def _spider(url: urllib.parse.ParseResult, collect_nested: bool, _visited: Set[s
                 subcalls.append(abs_link)
                 _visited.add(abs_link)
 
-    except URLError as e:
+    except OSError as e:
         tty.debug(f"[SPIDER] Unable to read: {url}")
         tty.debug(str(e), level=2)
-        if hasattr(e, "reason") and isinstance(e.reason, ssl.SSLError):
+        if isinstance(e, URLError) and isinstance(e.reason, ssl.SSLError):
             tty.warn(
                 "Spack was unable to fetch url list due to a "
                 "certificate verification problem. You can try "

@@ -1,5 +1,4 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
@@ -8,7 +7,6 @@
 import base64
 import json
 import re
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,12 +15,10 @@ from http.client import HTTPResponse
 from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple
 from urllib.request import Request
 
-import llnl.util.lang
-
 import spack.config
-import spack.mirror
-import spack.parser
-import spack.repo
+import spack.llnl.util.lang
+import spack.mirrors.mirror
+import spack.tokenize
 import spack.util.web
 
 from .image import ImageReference
@@ -42,7 +38,7 @@ OpenType = Callable[..., HTTPResponse]
 MaybeOpen = Optional[OpenType]
 
 #: Opener that automatically uses OCI authentication based on mirror config
-urlopen: OpenType = llnl.util.lang.Singleton(_urlopen)
+urlopen: OpenType = spack.llnl.util.lang.Singleton(_urlopen)
 
 
 SP = r" "
@@ -58,7 +54,7 @@ quoted_pair = rf"\\([{HTAB}{SP}{VCHAR}{obs_text}])"
 quoted_string = rf'"(?:({qdtext}*)|{quoted_pair})*"'
 
 
-class TokenType(spack.parser.TokenBase):
+class WwwAuthenticateTokens(spack.tokenize.TokenBase):
     AUTH_PARAM = rf"({token}){BWS}={BWS}({token}|{quoted_string})"
     # TOKEN68 = r"([A-Za-z0-9\-._~+/]+=*)"  # todo... support this?
     TOKEN = rf"{tchar}+"
@@ -69,9 +65,7 @@ class TokenType(spack.parser.TokenBase):
     ANY = r"."
 
 
-TOKEN_REGEXES = [rf"(?P<{token}>{token.regex})" for token in TokenType]
-
-ALL_TOKENS = re.compile("|".join(TOKEN_REGEXES))
+WWW_AUTHENTICATE_TOKENIZER = spack.tokenize.Tokenizer(WwwAuthenticateTokens)
 
 
 class State(Enum):
@@ -80,18 +74,6 @@ class State(Enum):
     AUTH_PARAM = auto()
     NEXT_IN_LIST = auto()
     AUTH_PARAM_OR_SCHEME = auto()
-
-
-def tokenize(input: str):
-    scanner = ALL_TOKENS.scanner(input)  # type: ignore[attr-defined]
-
-    for match in iter(scanner.match, None):  # type: ignore[var-annotated]
-        yield spack.parser.Token(
-            TokenType.__members__[match.lastgroup],  # type: ignore[attr-defined]
-            match.group(),  # type: ignore[attr-defined]
-            match.start(),  # type: ignore[attr-defined]
-            match.end(),  # type: ignore[attr-defined]
-        )
 
 
 class Challenge:
@@ -113,6 +95,14 @@ class Challenge:
             and self.params == other.params
         )
 
+    def matches_scheme(self, scheme: str) -> bool:
+        """Checks whether the challenge matches the given scheme, case-insensitive."""
+        return self.scheme == scheme.lower()
+
+    def get_param(self, key: str) -> Optional[str]:
+        """Get the value of an auth param by key, or None if not found."""
+        return next((v for k, v in self.params if k == key.lower()), None)
+
 
 def parse_www_authenticate(input: str):
     """Very basic parsing of www-authenticate parsing (RFC7235 section 4.1)
@@ -129,49 +119,49 @@ def parse_www_authenticate(input: str):
     unquote = lambda s: _unquote(r"\1", s[1:-1])
 
     mode: State = State.CHALLENGE
-    tokens = tokenize(input)
+    tokens = WWW_AUTHENTICATE_TOKENIZER.tokenize(input)
 
     current_challenge = Challenge()
 
     def extract_auth_param(input: str) -> Tuple[str, str]:
         key, value = input.split("=", 1)
-        key = key.rstrip()
+        key = key.rstrip().lower()
         value = value.lstrip()
         if value.startswith('"'):
             value = unquote(value)
         return key, value
 
     while True:
-        token: spack.parser.Token = next(tokens)
+        token: spack.tokenize.Token = next(tokens)
 
         if mode == State.CHALLENGE:
-            if token.kind == TokenType.EOF:
+            if token.kind == WwwAuthenticateTokens.EOF:
                 raise ValueError(token)
-            elif token.kind == TokenType.TOKEN:
-                current_challenge.scheme = token.value
+            elif token.kind == WwwAuthenticateTokens.TOKEN:
+                current_challenge.scheme = token.value.lower()
                 mode = State.AUTH_PARAM_LIST_START
             else:
                 raise ValueError(token)
 
         elif mode == State.AUTH_PARAM_LIST_START:
-            if token.kind == TokenType.EOF:
+            if token.kind == WwwAuthenticateTokens.EOF:
                 challenges.append(current_challenge)
                 break
-            elif token.kind == TokenType.COMMA:
+            elif token.kind == WwwAuthenticateTokens.COMMA:
                 # Challenge without param list, followed by another challenge.
                 challenges.append(current_challenge)
                 current_challenge = Challenge()
                 mode = State.CHALLENGE
-            elif token.kind == TokenType.SPACE:
+            elif token.kind == WwwAuthenticateTokens.SPACE:
                 # A space means it must be followed by param list
                 mode = State.AUTH_PARAM
             else:
                 raise ValueError(token)
 
         elif mode == State.AUTH_PARAM:
-            if token.kind == TokenType.EOF:
+            if token.kind == WwwAuthenticateTokens.EOF:
                 raise ValueError(token)
-            elif token.kind == TokenType.AUTH_PARAM:
+            elif token.kind == WwwAuthenticateTokens.AUTH_PARAM:
                 key, value = extract_auth_param(token.value)
                 current_challenge.params.append((key, value))
                 mode = State.NEXT_IN_LIST
@@ -179,22 +169,22 @@ def parse_www_authenticate(input: str):
                 raise ValueError(token)
 
         elif mode == State.NEXT_IN_LIST:
-            if token.kind == TokenType.EOF:
+            if token.kind == WwwAuthenticateTokens.EOF:
                 challenges.append(current_challenge)
                 break
-            elif token.kind == TokenType.COMMA:
+            elif token.kind == WwwAuthenticateTokens.COMMA:
                 mode = State.AUTH_PARAM_OR_SCHEME
             else:
                 raise ValueError(token)
 
         elif mode == State.AUTH_PARAM_OR_SCHEME:
-            if token.kind == TokenType.EOF:
+            if token.kind == WwwAuthenticateTokens.EOF:
                 raise ValueError(token)
-            elif token.kind == TokenType.TOKEN:
+            elif token.kind == WwwAuthenticateTokens.TOKEN:
                 challenges.append(current_challenge)
-                current_challenge = Challenge(token.value)
+                current_challenge = Challenge(token.value.lower())
                 mode = State.AUTH_PARAM_LIST_START
-            elif token.kind == TokenType.AUTH_PARAM:
+            elif token.kind == WwwAuthenticateTokens.AUTH_PARAM:
                 key, value = extract_auth_param(token.value)
                 current_challenge.params.append((key, value))
                 mode = State.NEXT_IN_LIST
@@ -212,23 +202,40 @@ class UsernamePassword(NamedTuple):
     username: str
     password: str
 
+    @property
+    def basic_auth_header(self) -> str:
+        encoded = base64.b64encode(f"{self.username}:{self.password}".encode("utf-8")).decode(
+            "utf-8"
+        )
+        return f"Basic {encoded}"
 
-def get_bearer_challenge(challenges: List[Challenge]) -> Optional[RealmServiceScope]:
-    # Find a challenge that we can handle (currently only Bearer)
-    challenge = next((c for c in challenges if c.scheme == "Bearer"), None)
+
+def _get_bearer_challenge(challenges: List[Challenge]) -> Optional[RealmServiceScope]:
+    """Return the realm/service/scope for a Bearer auth challenge, or None if not found."""
+    challenge = next((c for c in challenges if c.matches_scheme("Bearer")), None)
 
     if challenge is None:
         return None
 
     # Get realm / service / scope from challenge
-    realm = next((v for k, v in challenge.params if k == "realm"), None)
-    service = next((v for k, v in challenge.params if k == "service"), None)
-    scope = next((v for k, v in challenge.params if k == "scope"), None)
+    realm = challenge.get_param("realm")
+    service = challenge.get_param("service")
+    scope = challenge.get_param("scope")
 
     if realm is None or service is None or scope is None:
         return None
 
     return RealmServiceScope(realm, service, scope)
+
+
+def _get_basic_challenge(challenges: List[Challenge]) -> Optional[str]:
+    """Return the realm for a Basic auth challenge, or None if not found."""
+    challenge = next((c for c in challenges if c.matches_scheme("Basic")), None)
+
+    if challenge is None:
+        return None
+
+    return challenge.get_param("realm")
 
 
 class OCIAuthHandler(urllib.request.BaseHandler):
@@ -239,53 +246,8 @@ class OCIAuthHandler(urllib.request.BaseHandler):
         """
         self.credentials_provider = credentials_provider
 
-        # Cached bearer tokens for a given domain.
-        self.cached_tokens: Dict[str, str] = {}
-
-    def obtain_bearer_token(self, registry: str, challenge: RealmServiceScope, timeout) -> str:
-        # See https://docs.docker.com/registry/spec/auth/token/
-
-        query = urllib.parse.urlencode(
-            {"service": challenge.service, "scope": challenge.scope, "client_id": "spack"}
-        )
-
-        parsed = urllib.parse.urlparse(challenge.realm)._replace(
-            query=query, fragment="", params=""
-        )
-
-        # Don't send credentials over insecure transport.
-        if parsed.scheme != "https":
-            raise ValueError(
-                f"Cannot login to {registry} over insecure {parsed.scheme} connection"
-            )
-
-        request = Request(urllib.parse.urlunparse(parsed))
-
-        # I guess we shouldn't cache this, since we don't know
-        # the context in which it's used (may depend on config)
-        pair = self.credentials_provider(registry)
-
-        if pair is not None:
-            encoded = base64.b64encode(f"{pair.username}:{pair.password}".encode("utf-8")).decode(
-                "utf-8"
-            )
-            request.add_unredirected_header("Authorization", f"Basic {encoded}")
-
-        # Do a GET request.
-        response = self.parent.open(request, timeout=timeout)
-
-        # Read the response and parse the JSON
-        response_json = json.load(response)
-
-        # Get the token from the response
-        token = response_json["token"]
-
-        # Remember the last obtained token for this registry
-        # Note: we should probably take into account realm, service and scope
-        # so we can store multiple tokens for the same registry.
-        self.cached_tokens[registry] = token
-
-        return token
+        # Cached authorization headers for a given domain.
+        self.cached_auth_headers: Dict[str, str] = {}
 
     def https_request(self, req: Request):
         # Eagerly add the bearer token to the request if no
@@ -298,13 +260,64 @@ class OCIAuthHandler(urllib.request.BaseHandler):
             return req
 
         parsed = urllib.parse.urlparse(req.full_url)
-        token = self.cached_tokens.get(parsed.netloc)
+        auth_header = self.cached_auth_headers.get(parsed.netloc)
 
-        if not token:
+        if not auth_header:
             return req
 
-        req.add_unredirected_header("Authorization", f"Bearer {token}")
+        req.add_unredirected_header("Authorization", auth_header)
         return req
+
+    def _try_bearer_challenge(
+        self,
+        challenges: List[Challenge],
+        credentials: Optional[UsernamePassword],
+        timeout: Optional[float],
+    ) -> Optional[str]:
+        # Check whether a Bearer challenge is present in the WWW-Authenticate header
+        challenge = _get_bearer_challenge(challenges)
+        if not challenge:
+            return None
+
+        # Get the token from the auth handler
+        query = urllib.parse.urlencode(
+            {"service": challenge.service, "scope": challenge.scope, "client_id": "spack"}
+        )
+        parsed = urllib.parse.urlparse(challenge.realm)._replace(
+            query=query, fragment="", params=""
+        )
+
+        # Don't send credentials over insecure transport.
+        if parsed.scheme != "https":
+            raise ValueError(f"Cannot login over insecure {parsed.scheme} connection")
+
+        request = Request(urllib.parse.urlunparse(parsed), method="GET")
+
+        if credentials is not None:
+            request.add_unredirected_header("Authorization", credentials.basic_auth_header)
+
+        # Do a GET request.
+        response = self.parent.open(request, timeout=timeout)
+        try:
+            response_json = json.load(response)
+            token = response_json.get("token")
+            if token is None:
+                token = response_json.get("access_token")
+            assert type(token) is str
+        except Exception as e:
+            raise ValueError(f"Malformed token response from {challenge.realm}") from e
+        return f"Bearer {token}"
+
+    def _try_basic_challenge(
+        self, challenges: List[Challenge], credentials: UsernamePassword
+    ) -> Optional[str]:
+        # Check whether a Basic challenge is present in the WWW-Authenticate header
+        # A realm is required for Basic auth, although we don't use it here. Leave this as a
+        # validation step.
+        realm = _get_basic_challenge(challenges)
+        if not realm:
+            return None
+        return credentials.basic_auth_header
 
     def http_error_401(self, req: Request, fp, code, msg, headers):
         # Login failed, avoid infinite recursion where we go back and
@@ -321,71 +334,69 @@ class OCIAuthHandler(urllib.request.BaseHandler):
                 req, code, "Cannot login to registry, missing WWW-Authenticate header", headers, fp
             )
 
-        header_value = headers["WWW-Authenticate"]
+        www_auth_str = headers["WWW-Authenticate"]
 
         try:
-            challenge = get_bearer_challenge(parse_www_authenticate(header_value))
+            challenges = parse_www_authenticate(www_auth_str)
         except ValueError as e:
             raise spack.util.web.DetailedHTTPError(
                 req,
                 code,
-                f"Cannot login to registry, malformed WWW-Authenticate header: {header_value}",
+                f"Cannot login to registry, malformed WWW-Authenticate header: {www_auth_str}",
                 headers,
                 fp,
             ) from e
 
-        # If there is no bearer challenge, we can't handle it
-        if not challenge:
-            raise spack.util.web.DetailedHTTPError(
-                req,
-                code,
-                f"Cannot login to registry, unsupported authentication scheme: {header_value}",
-                headers,
-                fp,
-            )
+        registry = urllib.parse.urlparse(req.get_full_url()).netloc
 
-        # Get the token from the auth handler
+        credentials = self.credentials_provider(registry)
+
+        # First try Bearer, then Basic
         try:
-            token = self.obtain_bearer_token(
-                registry=urllib.parse.urlparse(req.get_full_url()).netloc,
-                challenge=challenge,
-                timeout=req.timeout,
-            )
-        except ValueError as e:
+            auth_header = self._try_bearer_challenge(challenges, credentials, req.timeout)
+            if not auth_header and credentials:
+                auth_header = self._try_basic_challenge(challenges, credentials)
+        except Exception as e:
+            raise spack.util.web.DetailedHTTPError(
+                req, code, f"Cannot login to registry: {e}", headers, fp
+            ) from e
+
+        if not auth_header:
             raise spack.util.web.DetailedHTTPError(
                 req,
                 code,
-                f"Cannot login to registry, failed to obtain bearer token: {e}",
+                f"Cannot login to registry, unsupported authentication scheme: {www_auth_str}",
                 headers,
                 fp,
-            ) from e
+            )
 
-        # Add the token to the request
-        req.add_unredirected_header("Authorization", f"Bearer {token}")
+        self.cached_auth_headers[registry] = auth_header
+
+        # Add the authorization header to the request
+        req.add_unredirected_header("Authorization", auth_header)
         setattr(req, "login_attempted", True)
 
         return self.parent.open(req, timeout=req.timeout)
 
 
 def credentials_from_mirrors(
-    domain: str, *, mirrors: Optional[Iterable[spack.mirror.Mirror]] = None
+    domain: str, *, mirrors: Optional[Iterable[spack.mirrors.mirror.Mirror]] = None
 ) -> Optional[UsernamePassword]:
     """Filter out OCI registry credentials from a list of mirrors."""
 
-    mirrors = mirrors or spack.mirror.MirrorCollection().values()
+    mirrors = mirrors or spack.mirrors.mirror.MirrorCollection().values()
 
     for mirror in mirrors:
         # Prefer push credentials over fetch. Unlikely that those are different
         # but our config format allows it.
         for direction in ("push", "fetch"):
-            pair = mirror.get_access_pair(direction)
-            if pair is None:
+            pair = mirror.get_credentials(direction).get("access_pair")
+            if not pair:
                 continue
+
             url = mirror.get_url(direction)
-            if not url.startswith("oci://"):
-                continue
             try:
-                parsed = ImageReference.from_string(url[6:])
+                parsed = ImageReference.from_url(url)
             except ValueError:
                 continue
             if parsed.domain == domain:
@@ -397,8 +408,10 @@ def create_opener():
     """Create an opener that can handle OCI authentication."""
     opener = urllib.request.OpenerDirector()
     for handler in [
+        urllib.request.ProxyHandler(),
         urllib.request.UnknownHandler(),
-        urllib.request.HTTPSHandler(),
+        urllib.request.HTTPHandler(),
+        spack.util.web.SpackHTTPSHandler(context=spack.util.web.ssl_create_default_context()),
         spack.util.web.SpackHTTPDefaultErrorHandler(),
         urllib.request.HTTPRedirectHandler(),
         urllib.request.HTTPErrorProcessor(),
@@ -418,21 +431,4 @@ def ensure_status(request: urllib.request.Request, response: HTTPResponse, statu
     )
 
 
-def default_retry(f, retries: int = 3, sleep=None):
-    sleep = sleep or time.sleep
-
-    def wrapper(*args, **kwargs):
-        for i in range(retries):
-            try:
-                return f(*args, **kwargs)
-            except urllib.error.HTTPError as e:
-                # Retry on internal server errors, and rate limit errors
-                # Potentially this could take into account the Retry-After header
-                # if registries support it
-                if i + 1 != retries and (500 <= e.code < 600 or e.code == 429):
-                    # Exponential backoff
-                    sleep(2**i)
-                    continue
-                raise
-
-    return wrapper
+default_retry = spack.util.web.retry_on_transient_error

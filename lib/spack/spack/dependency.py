@@ -1,12 +1,15 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 """Data structures that represent Spack's dependency relationships."""
-from typing import Dict, List
+from typing import TYPE_CHECKING, Dict, List, Type
 
 import spack.deptypes as dt
 import spack.spec
+
+if TYPE_CHECKING:
+    import spack.package_base
+    import spack.patch
 
 
 class Dependency:
@@ -36,10 +39,12 @@ class Dependency:
 
     """
 
+    __slots__ = "pkg", "spec", "patches", "depflag"
+
     def __init__(
         self,
-        pkg: "spack.package_base.PackageBase",
-        spec: "spack.spec.Spec",
+        pkg: Type["spack.package_base.PackageBase"],
+        spec: spack.spec.Spec,
         depflag: dt.DepFlag = dt.DEFAULT,
     ):
         """Create a new Dependency.
@@ -49,33 +54,18 @@ class Dependency:
             spec: Spec indicating dependency requirements
             type: strings describing dependency relationship
         """
-        assert isinstance(spec, spack.spec.Spec)
-
         self.pkg = pkg
-        self.spec = spec.copy()
+        self.spec = spec
 
         # This dict maps condition specs to lists of Patch objects, just
         # as the patches dict on packages does.
-        self.patches: Dict[spack.spec.Spec, "List[spack.patch.Patch]"] = {}
+        self.patches: Dict[spack.spec.Spec, List["spack.patch.Patch"]] = {}
         self.depflag = depflag
 
     @property
     def name(self) -> str:
         """Get the name of the dependency package."""
         return self.spec.name
-
-    def merge(self, other: "Dependency"):
-        """Merge constraints, deptypes, and patches of other into self."""
-        self.spec.constrain(other.spec)
-        self.depflag |= other.depflag
-
-        # concatenate patch lists, or just copy them in
-        for cond, p in other.patches.items():
-            if cond in self.patches:
-                current_list = self.patches[cond]
-                current_list.extend(p for p in other.patches[cond] if p not in current_list)
-            else:
-                self.patches[cond] = other.patches[cond]
 
     def __repr__(self) -> str:
         types = dt.flag_to_chars(self.depflag)

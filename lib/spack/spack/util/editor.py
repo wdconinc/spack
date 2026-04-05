@@ -1,5 +1,4 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
@@ -10,15 +9,14 @@ user's VISUAL environment variable if set. We fall back to the editor
 defined by the EDITOR environment variable if VISUAL is not set or the
 specified editor fails (e.g. no DISPLAY for a graphical editor). If
 neither variable is set, we fall back to one of several common editors,
-raising an EnvironmentError if we are unable to find one.
+raising an OSError if we are unable to find one.
 """
 import os
 import shlex
 from typing import Callable, List
 
-import llnl.util.tty as tty
-
 import spack.config
+import spack.llnl.util.tty as tty
 import spack.util.executable
 
 #: editors to try if VISUAL and EDITOR are not set
@@ -66,9 +64,9 @@ def editor(*args: str, exec_fn: Callable[[str, List[str]], int] = os.execv) -> b
 
     This will try to execute the following, in order:
 
-      1. $VISUAL <args>    # the "visual" editor (per POSIX)
-      2. $EDITOR <args>    # the regular editor (per POSIX)
-      3. some default editor (see ``_default_editors``) with <args>
+    1. ``$VISUAL <args>``: the "visual" editor (per POSIX)
+    2. ``$EDITOR <args>``: the regular editor (per POSIX)
+    3. some default editor (see ``_default_editors``) with <args>
 
     If an environment variable isn't defined, it is skipped.  If it
     points to something that can't be executed, we'll print a
@@ -78,7 +76,6 @@ def editor(*args: str, exec_fn: Callable[[str, List[str]], int] = os.execv) -> b
     Arguments:
         args: args to pass to editor
 
-    Optional Arguments:
         exec_fn: invoke this function to run; use ``spack.util.editor.executable`` if you
             want something that returns, instead of the default ``os.execv()``.
     """
@@ -142,7 +139,7 @@ def editor(*args: str, exec_fn: Callable[[str, List[str]], int] = os.execv) -> b
         return True
 
     # Fail if nothing could be found
-    raise EnvironmentError(
+    raise OSError(
         "No text editor found! Please set the VISUAL and/or EDITOR "
         "environment variable(s) to your preferred text editor."
     )

@@ -1,5 +1,4 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
@@ -7,17 +6,17 @@ import argparse
 import re
 import sys
 
-import llnl.util.tty as tty
-import llnl.util.tty.color as color
-
 import spack
 import spack.cmd
+import spack.cmd.spec
 import spack.config
 import spack.environment
 import spack.hash_types as ht
+import spack.llnl.util.tty as tty
+import spack.llnl.util.tty.color as color
 import spack.package_base
 import spack.solver.asp as asp
-from spack.cmd.common import arguments
+import spack.spec
 
 description = "concretize a specs using an ASP solver"
 section = "developer"
@@ -27,7 +26,7 @@ level = "long"
 show_options = ("asp", "opt", "output", "solutions")
 
 
-def setup_parser(subparser):
+def setup_parser(subparser: argparse.ArgumentParser) -> None:
     # Solver arguments
     subparser.add_argument(
         "--show",
@@ -40,42 +39,6 @@ def setup_parser(subparser):
         "  solutions    models found by asp program\n"
         "  all          all of the above",
     )
-
-    # Below are arguments w.r.t. spec display (like spack spec)
-    arguments.add_common_arguments(subparser, ["long", "very_long", "namespaces"])
-
-    install_status_group = subparser.add_mutually_exclusive_group()
-    arguments.add_common_arguments(install_status_group, ["install_status", "no_install_status"])
-
-    subparser.add_argument(
-        "-y",
-        "--yaml",
-        action="store_const",
-        dest="format",
-        default=None,
-        const="yaml",
-        help="print concrete spec as yaml",
-    )
-    subparser.add_argument(
-        "-j",
-        "--json",
-        action="store_const",
-        dest="format",
-        default=None,
-        const="json",
-        help="print concrete spec as json",
-    )
-    subparser.add_argument(
-        "-c",
-        "--cover",
-        action="store",
-        default="nodes",
-        choices=["nodes", "edges", "paths"],
-        help="how extensively to traverse the DAG (default: nodes)",
-    )
-    subparser.add_argument(
-        "-t", "--types", action="store_true", default=False, help="show dependency types"
-    )
     subparser.add_argument(
         "--timers",
         action="store_true",
@@ -85,45 +48,56 @@ def setup_parser(subparser):
     subparser.add_argument(
         "--stats", action="store_true", default=False, help="print out statistics from clingo"
     )
-    subparser.add_argument("specs", nargs=argparse.REMAINDER, help="specs of packages")
 
-    spack.cmd.common.arguments.add_concretizer_args(subparser)
+    spack.cmd.spec.setup_parser(subparser)
 
 
 def _process_result(result, show, required_format, kwargs):
-    result.raise_if_unsat()
     opt, _, _ = min(result.answers)
     if ("opt" in show) and (not required_format):
         tty.msg("Best of %d considered solutions." % result.nmodels)
-        tty.msg("Optimization Criteria:")
 
-        maxlen = max(len(s[2]) for s in result.criteria)
-        color.cprint("@*{  Priority  Criterion %sInstalled  ToBuild}" % ((maxlen - 10) * " "))
+        print()
+        maxlen = max(len(s.name) for s in result.criteria)
+        color.cprint("@*{  Priority  Value  Criterion}")
 
-        fmt = "  @K{%%-8d}  %%-%ds%%9s  %%7s" % maxlen
-        for i, (installed_cost, build_cost, name) in enumerate(result.criteria, 1):
-            color.cprint(
-                fmt
-                % (
-                    i,
-                    name,
-                    "-" if build_cost is None else installed_cost,
-                    installed_cost if build_cost is None else build_cost,
-                )
-            )
+        for i, criterion in enumerate(result.criteria, 1):
+            value = f"@K{{{criterion.value:>5}}}"
+            grey_out = True
+            if criterion.value > 0:
+                value = f"@*{{{criterion.value:>5}}}"
+                grey_out = False
+
+            if grey_out:
+                lc = "@K"
+            elif criterion.kind == asp.OptimizationKind.CONCRETE:
+                lc = "@b"
+            elif criterion.kind == asp.OptimizationKind.BUILD:
+                lc = "@g"
+            else:
+                lc = "@y"
+
+            color.cprint(f"  @K{{{i:8}}}  {value}  {lc}{{{criterion.name:<{maxlen}}}}")
+        print()
+        print()
+        color.cprint("  @*{Legend:}")
+        color.cprint("    @g{Specs to be built}")
+        color.cprint("    @b{Reused specs}")
+        color.cprint("    @y{Other criteria}")
         print()
 
     # dump the solutions as concretized specs
     if "solutions" in show:
-        for spec in result.specs:
-            # With -y, just print YAML to output.
-            if required_format == "yaml":
-                # use write because to_yaml already has a newline.
-                sys.stdout.write(spec.to_yaml(hash=ht.dag_hash))
-            elif required_format == "json":
-                sys.stdout.write(spec.to_json(hash=ht.dag_hash))
-            else:
-                sys.stdout.write(spec.tree(color=sys.stdout.isatty(), **kwargs))
+        if required_format:
+            for spec in result.specs:
+                # With -y, just print YAML to output.
+                if required_format == "yaml":
+                    # use write because to_yaml already has a newline.
+                    sys.stdout.write(spec.to_yaml(hash=ht.dag_hash))
+                elif required_format == "json":
+                    sys.stdout.write(spec.to_json(hash=ht.dag_hash))
+        else:
+            sys.stdout.write(spack.spec.tree(result.specs, color=sys.stdout.isatty(), **kwargs))
         print()
 
     if result.unsolved_specs and "solutions" in show:
@@ -145,6 +119,12 @@ def solve(parser, args):
         "show_types": args.types,
         "status_fn": install_status_fn if args.install_status else None,
         "hashes": args.long or args.very_long,
+        "highlight_version_fn": (
+            spack.package_base.non_preferred_version if args.non_defaults else None
+        ),
+        "highlight_variant_fn": (
+            spack.package_base.non_default_variant if args.non_defaults else None
+        ),
     }
 
     # process output options
@@ -163,31 +143,19 @@ def solve(parser, args):
 
     # If we have an active environment, pick the specs from there
     env = spack.environment.active_environment()
-    if env and args.specs:
-        msg = "cannot give explicit specs when an environment is active"
-        raise RuntimeError(msg)
-
-    specs = list(env.user_specs) if env else spack.cmd.parse_specs(args.specs)
+    if args.specs:
+        specs = spack.cmd.parse_specs(args.specs)
+    elif env:
+        specs = list(env.user_specs)
+    else:
+        tty.die("spack solve requires at least one spec or an active environment")
 
     solver = asp.Solver()
     output = sys.stdout if "asp" in show else None
     setup_only = set(show) == {"asp"}
     unify = spack.config.get("concretizer:unify")
     allow_deprecated = spack.config.get("config:deprecated", False)
-    if unify != "when_possible":
-        # set up solver parameters
-        # Note: reuse and other concretizer prefs are passed as configuration
-        result = solver.solve(
-            specs,
-            out=output,
-            timers=args.timers,
-            stats=args.stats,
-            setup_only=setup_only,
-            allow_deprecated=allow_deprecated,
-        )
-        if not setup_only:
-            _process_result(result, show, required_format, kwargs)
-    else:
+    if unify == "when_possible":
         for idx, result in enumerate(
             solver.solve_in_rounds(
                 specs,
@@ -202,5 +170,31 @@ def solve(parser, args):
                 tty.msg("")
             else:
                 print("% END ROUND {0}\n".format(idx))
+            if not setup_only:
+                _process_result(result, show, required_format, kwargs)
+    elif unify:
+        # set up solver parameters
+        # Note: reuse and other concretizer prefs are passed as configuration
+        result = solver.solve(
+            specs,
+            out=output,
+            timers=args.timers,
+            stats=args.stats,
+            setup_only=setup_only,
+            allow_deprecated=allow_deprecated,
+        )
+        if not setup_only:
+            _process_result(result, show, required_format, kwargs)
+    else:
+        for spec in specs:
+            tty.msg("SOLVING SPEC:", spec)
+            result = solver.solve(
+                [spec],
+                out=output,
+                timers=args.timers,
+                stats=args.stats,
+                setup_only=setup_only,
+                allow_deprecated=allow_deprecated,
+            )
             if not setup_only:
                 _process_result(result, show, required_format, kwargs)

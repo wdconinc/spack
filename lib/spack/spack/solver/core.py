@@ -1,14 +1,14 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
-"""Low-level wrappers around clingo API."""
+"""Low-level wrappers around clingo API and other basic functionality related to ASP"""
 import importlib
 import pathlib
 from types import ModuleType
-from typing import Any, Callable, NamedTuple, Optional, Tuple, Union
+from typing import Any, Callable, NamedTuple, Optional, Tuple
 
-from llnl.util import lang
+import spack.platforms
+from spack.llnl.util import lang
 
 
 def _ast_getter(*names: str) -> Callable[[Any], Any]:
@@ -28,33 +28,30 @@ ast_type = _ast_getter("ast_type", "type")
 ast_sym = _ast_getter("symbol", "term")
 
 
-class AspObject:
-    """Object representing a piece of ASP code."""
+class AspVar:
+    """Represents a variable in an ASP rule, allows for conditionally generating
+    rules"""
 
+    __slots__ = ("name",)
 
-def _id(thing: Any) -> Union[str, AspObject]:
-    """Quote string if needed for it to be a valid identifier."""
-    if isinstance(thing, AspObject):
-        return thing
-    elif isinstance(thing, bool):
-        return f'"{str(thing)}"'
-    elif isinstance(thing, int):
-        return str(thing)
-    else:
-        return f'"{str(thing)}"'
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __str__(self) -> str:
+        return str(self.name)
 
 
 @lang.key_ordering
-class AspFunction(AspObject):
+class AspFunction:
     """A term in the ASP logic program"""
 
-    __slots__ = ["name", "args"]
+    __slots__ = ("name", "args")
 
-    def __init__(self, name: str, args: Optional[Tuple[Any, ...]] = None) -> None:
+    def __init__(self, name: str, args: Tuple[Any, ...] = ()) -> None:
         self.name = name
-        self.args = () if args is None else tuple(args)
+        self.args = args
 
-    def _cmp_key(self) -> Tuple[str, Optional[Tuple[Any, ...]]]:
+    def _cmp_key(self) -> Tuple[str, Tuple[Any, ...]]:
         return self.name, self.args
 
     def __call__(self, *args: Any) -> "AspFunction":
@@ -80,31 +77,24 @@ class AspFunction(AspObject):
         """
         return AspFunction(self.name, self.args + args)
 
-    def _argify(self, arg: Any) -> Any:
-        """Turn the argument into an appropriate clingo symbol"""
-        if isinstance(arg, bool):
-            return clingo().String(str(arg))
-        elif isinstance(arg, int):
-            return clingo().Number(arg)
-        elif isinstance(arg, AspFunction):
-            return clingo().Function(arg.name, [self._argify(x) for x in arg.args], positive=True)
-        return clingo().String(str(arg))
-
-    def symbol(self):
-        """Return a clingo symbol for this function"""
-        return clingo().Function(
-            self.name, [self._argify(arg) for arg in self.args], positive=True
-        )
-
     def __str__(self) -> str:
-        return f"{self.name}({', '.join(str(_id(arg)) for arg in self.args)})"
+        parts = []
+        for arg in self.args:
+            if type(arg) is str:
+                arg = arg.replace("\\", r"\\").replace("\n", r"\n").replace('"', r"\"")
+                parts.append(f'"{arg}"')
+            elif type(arg) is AspFunction or type(arg) is int or type(arg) is AspVar:
+                parts.append(str(arg))
+            else:
+                parts.append(f'"{arg}"')
+        return f"{self.name}({','.join(parts)})"
 
     def __repr__(self) -> str:
         return str(self)
 
 
 class _AspFunctionBuilder:
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> AspFunction:
         return AspFunction(name)
 
 
@@ -195,7 +185,7 @@ def _bootstrap_clingo() -> ModuleType:
     import spack.bootstrap
 
     with spack.bootstrap.ensure_bootstrap_configuration():
-        spack.bootstrap.ensure_core_dependencies()
+        spack.bootstrap.ensure_clingo_importable_or_raise()
         clingo_mod = importlib.import_module("clingo")
 
     return clingo_mod
@@ -223,20 +213,27 @@ def parse_term(*args, **kwargs):
         return clingo().parse_term(*args, **kwargs)
 
 
-class NodeArgument(NamedTuple):
+class NodeId(NamedTuple):
     """Represents a node in the DAG"""
 
     id: str
     pkg: str
 
 
+class NodeFlag(NamedTuple):
+    flag_type: str
+    flag: str
+    flag_group: str
+    source: str
+
+
 def intermediate_repr(sym):
     """Returns an intermediate representation of clingo models for Spack's spec builder.
 
-    Currently, transforms symbols from clingo models either to strings or to NodeArgument objects.
+    Currently, transforms symbols from clingo models either to strings or to NodeId objects.
 
     Returns:
-        This will turn a ``clingo.Symbol`` into a string or NodeArgument, or a sequence of
+        This will turn a ``clingo.Symbol`` into a string or NodeId, or a sequence of
         ``clingo.Symbol`` objects into a tuple of those objects.
     """
     # TODO: simplify this when we no longer have to support older clingo versions.
@@ -245,8 +242,15 @@ def intermediate_repr(sym):
 
     try:
         if sym.name == "node":
-            return NodeArgument(
+            return NodeId(
                 id=intermediate_repr(sym.arguments[0]), pkg=intermediate_repr(sym.arguments[1])
+            )
+        elif sym.name == "node_flag":
+            return NodeFlag(
+                flag_type=intermediate_repr(sym.arguments[0]),
+                flag=intermediate_repr(sym.arguments[1]),
+                flag_group=intermediate_repr(sym.arguments[2]),
+                source=intermediate_repr(sym.arguments[3]),
             )
     except RuntimeError:
         # This happens when using clingo w/ CFFI and trying to access ".name" for symbols
@@ -270,3 +274,25 @@ def extract_args(model, predicate_name):
     return their intermediate representation.
     """
     return [intermediate_repr(sym.arguments) for sym in model if sym.name == predicate_name]
+
+
+class SourceContext:
+    """Tracks context in which a Spec's clause-set is generated (i.e.
+    with ``SpackSolverSetup.spec_clauses``).
+
+    Facts generated for the spec may include this context.
+    """
+
+    def __init__(self, *, source: Optional[str] = None):
+        # This can be "literal" for constraints that come from a user
+        # spec (e.g. from the command line); it can be the output of
+        # `ConstraintOrigin.append_type_suffix`; the default is "none"
+        # (which means it isn't important to keep track of the source
+        # in that case).
+        self.source = "none" if source is None else source
+        self.wrap_node_requirement: Optional[bool] = None
+
+
+def using_libc_compatibility() -> bool:
+    """Returns True if we are currently using libc compatibility"""
+    return spack.platforms.host().name == "linux"

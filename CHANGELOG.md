@@ -1,3 +1,1793 @@
+# v1.1.1 (2026-01-14)
+
+## Usability and performance enhancements
+
+* solver: do a precheck for non-existing and deprecated versions #51555
+* improvements to solver performance (PRs 51591, 51605, 51612, 51625)
+* python 3.14 support (PRs 51686, 51687, 51688, 51689, 51663)
+* display when conditions with dependencies in spack info #51588
+* spack repo remove: allow removing from unspecified scope #51563
+* spack compiler info: show non-external compilers too #51718
+
+## Improvements to the experimental new installer
+
+* support forkserver #51788 (for python 3.14 support)
+* support --dirty, --keep-stage, and `skip patch` arguments #51558
+* implement --use-buildcache, --cache-only, --use-cache and --only arguments #51593
+* implement overwrite, keep_prefix #51622
+* implement --dont-restage #51623
+* fix logging #51787
+
+## Bugfixes
+
+* repo.py: support rhel 7 #51617
+* solver: match glibc constraints by hash #51559
+* buildache list: list the component prefix not the root #51635
+* solver: fix issue with conditional language dependencies #51692
+* repo.py: fix checking out commits #51695
+* spec parser: ensure toolchains are expanded to different objects #51731
+* RHEL7 git 1.8.3.1 fix #51779
+* RewireTask.complete: return value from \_process\_binary\_cache\_tarball #51825
+
+## Documentation
+
+* docs: fix default projections setting discrepancy #51640
+
+
+# v1.1.0 (2025-11-14)
+
+`v1.1.0` features major improvements to **compiler handling** and **configuration management**, a significant refactoring of **externals**, and exciting new **experimental features** like a console UI for parallel installations and concretization caching.
+
+## Major new features
+
+1. **Enhanced Compiler Control and Unmixing**
+
+   * Compiler unmixing (#51135)
+   * Propagated compiler preferences (#51383)
+
+   In Spack v1.0, support for compilers as nodes made it much easier to mix compilers for the same language on different packages in a Spec. This increased flexibility, but did not offer  options to constrain compiler selection when needed.
+
+   * #51135 introduces the `concretizer:compiler_mixing` config option. When disabled, all specs in the "root unification set" (root specs and their transitive link/run deps) will be assigned a single compiler for each language. You can also specify a list of packages to be excepted from the restriction.
+
+   * #51383 introduces the `%%` sigil in the spec syntax. While `%` specifies a direct dependency for a single node, `%%` specifies a dependency for that node and a preference for its transitive link/run dependencies (at the same priority as the `prefer` key in `packages.yaml` config).
+
+2. **Customizable configuration** (#51162)
+
+   All configuration now stems from `$spack/etc/spack` and `$spack/etc/spack/defaults`, so the owner of a Spack instance can have full control over what configuration scopes exist.
+
+   * Scopes included in configuration can be named, and the builtin `site`, `user`, `system`, etc. scopes are now defined in configuration rather than hard-coded.
+   * `$spack/etc/spack/defaults` is the lowest priority.
+   * `$spack/etc/spack` *includes* the other scopes at lower precedence than itself.
+   * You can override with any scopes *except* the defaults with `include::`. e.g., `include::[]` in an environment allows you to ignore everything but defaults entirely.
+
+   Here is `$spack/etc/spack/include.yaml`:
+
+   ```yaml
+   include:
+     # user configuration scope
+     - name: "user"
+       path: "~/.spack"
+       optional: true
+       when: '"SPACK_DISABLE_LOCAL_CONFIG" not in env'
+
+     # site configuration scope
+     - name: "site"
+       path: "$spack/etc/spack/site"
+       optional: true
+
+     # system configuration scope
+     - name: "system"
+       path: "/etc/spack"
+       optional: true
+       when: '"SPACK_DISABLE_LOCAL_CONFIG" not in env'
+   ```
+
+   NOTE: This change inverts the priority order of configuration in `$spack/etc/spack` and `~/.spack`.
+
+   See the [configuration docs](https://spack.readthedocs.io/en/latest/configuration.html) and
+   [include docs](https://spack.readthedocs.io/en/latest/include_yaml.html) for
+   more information.
+
+3. **Git includes** (#51191)
+
+   Configuration files can now be included directly from a **remote Git repository**. This allows for easier sharing and versioning of complex configurations across teams or projects. These entries accept the same syntax as remote repository configuration, and can likewise be conditional with `when:`.
+
+   ```yaml
+   include:
+   - git: https://github.com/spack/spack-configs
+     branch: main
+     when: os == "centos7"
+     paths:
+     - USC/config/config.yaml
+     - USC/config/packages.yaml
+   ```
+
+   See [the docs](https://spack.readthedocs.io/en/latest/include_yaml.html#git-repository-files) for details.
+
+4. **Externals Can Now Have Dependencies** (#51118)
+
+   Externals are treated as concrete specs, so there is a 1:1 mapping between an entry in `packages.yaml` and any installed external spec (for a fixed repository).
+
+   Their YAML specification has been extended to allow modeling dependencies of external specs. This might be quite useful to better capture e.g. ROCm installations that are already installed on a given system, or in similar cases.
+
+   To be backward compatible with external specs specifying a compiler, for instance `mpich %gcc@9`, Spack will match the compiler specification to an existing external. It will fail when the specification is ambiguous, or if it does not match any other externals.
+
+
+## Experimental Features
+
+5. **New installer UI** (experimental, see #51434)
+
+   New, experimental console UI for the Spack installer that allows:
+
+   * Spack to show progress on multiple parallel processes concurrently;
+   * Users to view logs for different installations independently; and
+   * Spack to share a jobserver among multiple parallel builds.
+
+   Demo: https://asciinema.org/a/755827
+
+   Usage:
+
+   * Run this to enable by default (and persist across runs):
+     ```
+     spack config add config:installer:new
+     ```
+     or use:
+     ```
+     spack -c config:installer:new install ...
+     ```
+     to try one run with the new UI.
+   * The `-j` flag in spack install `-j <N> ...` is all you need, it will build packages in parallel. There is no need to set `-p`; the installer spawns as many builds as it can and shares work by default.
+   * Use `n` for next logs and `p/N` for previous logs
+   * Use `v` to toggle between logs and overview
+   * Use `q` or `Esc` to go from logs back to overview.
+   * Use `/` to enter search mode: filters the overview as you type; press `Enter` to follow logs or `Esc` to exit search mode.
+
+   > [!WARNING]
+   > This feature is experimental because it is not feature-complete to match the existing installer. See the issue #51515 for a list of features that are not completed. Particularly note that the new installer locks the entire database, and other spack instances will not install concurrently while it is running.
+
+6. **Concretization Caching** (experimental, see #50905, #51448)
+
+   Spack can cache concretization outputs for performance. With caching, Spack will still set up the concretization problem, but it can look up the solve result and avoid long solve times. This feature is currently off by default, but you can enable it with:
+
+   ```
+   spack config add concretizer:concretization_cache:enable:true
+   ```
+
+   > [!WARNING]
+   > Currently there is a bug that the cache will return results that do not properly reflect changes in the `package_hash` (that is, changes in the `package.py` source code). We will enable caching by default in a future release, when this bug is fixed.
+
+## Potentially breaking changes
+* Configurable configuration changes the precedence of the `site` scope.
+    * The `spack` scope (in `/etc/spack` within the Spack installation) is now the highest precedence scope
+    * The `site` scope is now *lower* precedence than `spack` and `user`.
+    * If you previously had configuration files in in `$spack/etc/spack`, they will take precedence over configuration in `~/.spack`. If you do not want that, move them to `$spack/etc/spack/site`.
+    * See #51162 for details.
+* Fixed a bug with command-line and environment scope ordering. The environment scope could previously override custom command-line scopes. Now, the active environment is *always* lower precedence than any configuration scopes provided on the command line. (#51461)
+
+## Other notable improvements
+
+### Improved error messages
+* solver: catch invalid dependencies during concretization (#51176)
+* improved errors for requirements (#45800)
+
+### Performance Improvements
+* `spack mirror create --all` now runs in parallel (#50901)
+* `spack develop`: fast automatic reconcretization (#51140)
+* Don't spawn a process for `--fake` installs (#51491)
+* Use `gethostname` instead of `getfqdn` (#51481)
+* Check for `commit` variant only if not developing (#51507)
+* Concretization performance improvements (#51160, #51152, #51416)
+* spack diff: fix performance bug (#51270)
+
+### Concretizer improvements
+* concretizer: fix direct dep w/ virtuals issue (#51037)
+* solver: reduce items in edge optimizations (#51503)
+
+### UI and Commands
+* Managed environments can now be organized into folders (#50994)
+* `spack info` shows full info about conditional dependencies and can filter by spec. (#51137)
+* `spack help` is now reorganized and has color sections (#51484)
+* `spack clean --all` means all (no exception for bootstrap cache) (#50984)
+* `--variants-by-name` no longer used (#51450)
+* `spack env create`: allow creation from env or env dir (#51433)
+
+## Notable Bugfixes
+* mirror: clean up stage when retrying (#43519)
+* Many smaller concretization fixes (#51361, #51355, #51341, #51347, #51282, #51190, #51226, #51065, #51064, #51074)
+* Bugfix for failed multi-node parallel installations (#50933)
+
+## Spack community stats
+
+* 1,681 commits
+* 8,611 packages in the 2025.11.0 release, 112 new since 2025.07.0
+* 276 people contributed to this release
+* 265 committers to packages
+* 31 committers to core
+
+See the [2025.11.0 release](https://github.com/spack/spack-packages/releases/tag/v2025.11.0) of [spack-packages](https://github.com/spack/spack-packages/) for more details.
+
+
+# v1.0.4 (2026-02-23)
+
+## Bug fixes
+
+* Concretizer bugfixes:
+  * solver: remove a special case for provider weighting #51347
+  * solver: improve timeout handling and add Ctrl-C interrupt safety #51341
+  * solver: simplify interrupt/timeout logic #51349
+* Repo management bugfixes:
+  * repo.py: support rhel 7 #51617
+  * repo.py: fix checking out commits #51695
+  * git: pull_checkout_branch RHEL7 git 1.8.3.1 fix #51779
+  * git: fix locking issue in pull_checkout_branch #51854
+  * spack repo remove: allow removing from unspecified scope #51563
+* build_environment.py: Prevent deadlock on install process join #51429
+* Fix typo in untrack_env #51554
+* audit.py: fix re.sub(..., N) positional count arg #51735
+
+## Enhancements
+
+* Support Macos Tahoe (#51373, #51394, #51479)
+* Support for Python 3.14, except for t-strings (#51686, #51687, #51688, #51697, #51663)
+* spack info: show conditional dependencies and licenses; allow filtering #51137
+* Spack fetch less likely to fail due to AI download protections #51496
+* config: relax concurrent_packages to minimum 0 #51840
+  * This avoids forward-incompatibility with Spack v1.2
+* Documentation improvements (#51315, #51640)
+
+
+# v1.0.3 (2026-02-20)
+
+Skipped due to a failure in the release process.
+
+
+# v1.0.2 (2025-09-11)
+
+## Bug Fixes
+
+* `spack config edit` can now open malformed YAML files. (#51088)
+* `spack edit -b` supports specifying the repository path or its namespace. (#51084)
+* `spack repo list` escapes the color code for paths that contain `@g`. (#51178)
+* Fixed various issues on the solver:
+  * Improved the error message when an invalid dependency is specified in the input. (#51176)
+  * Build the preferred compiler with itself by default. (#51201)
+  * Fixed a performance regression when using `unify:when_possible`. (#51226)
+  * Fixed an issue with strong preferences, when provider details are given. (#51263)
+  * Fixed an issue when specifying flags on a package that appears multiple times in the DAG. (#51218)
+* Fixed a regression for `zsh` in `spack env activate --prompt`. (#51258)
+* Fix a few cases where the `when` context manager was not dealing with direct dependencies correctly. (#51259)
+* Various fixes to string representations of specs. (#51207)
+
+## Enhancements
+
+* Various improvements to the documentation (#51145, #51151, #51147, #51181, #51172, #51188, #51195)
+* Greatly improve the performance of `spack diff`. (#51270)
+* `spack solve` highlights optimization weights in a more intuitive way. (#51198)
+
+# v1.0.1 (2025-08-11)
+
+## Bug Fixes
+
+* Ensure forward compatibility of package hashing with the upcoming Python 3.14 release. (#51042)
+* The `spack diff` command now shows differences in runtime dependencies (e.g., `gcc-runtime`, `glibc`), which were previously hidden. (#51076)
+* Fix a regression where the solver would mishandle a compiler that was required as both a build and a link dependency. (#51074)
+* Resolved issues with selecting external packages that have a specific compiler specified. (#51064)
+* Fix a bug where the concretizer would compute solution scores incorrectly when the package does not depend on a compiler. (#51037)
+* The solver now correctly evaluates and respects package requirements that specify a hash. (#51065)
+* Fix an issue where sparse checkouts for different packages could overwrite each other in a source cache or mirror. (#51080)
+* Prevent `spack repo add` from overwriting the default branch when initially cloning a repository. (#51105)
+* Add exception handling for bad URLs when fetching git provenance information. (#51022)
+* Spack no longer conflates git warning messages with command output. (#51045)
+* Fix an issue with non-path-based package repositories in environments. (#51055)
+* Spack now validates the terminal size and will fall back to `LINES` and `COLUMNS` environment variables if detection fails. (#51090)
+* Fix an issue where the package's fetcher was not being set correctly. (#51108)
+* Ensure `spack tutorial` clones Spack v1.0 instead of v0.23. (#51091)
+
+## Enhancements
+
+* Various improvements to the documentation (#51014, #51033, #51039, #51049, #51066, #51073, #51079, #51082, #51083, #51086, #51126, #51131, #51132, #51025)
+
+
+# v1.0.0 (2025-07-20)
+
+`v1.0.0` is a major feature release and a significant milestone. It introduces compiler
+dependencies, a foundational change that has been in development for almost seven years,
+and the project's first stable package API.
+
+If you are interested in more information, you can find more details on the road to
+v1.0, as well as its features, in talks from the 2025 Spack User Meeting. For example:
+* [State of the Spack Community](https://www.youtube.com/watch?v=4rInmUfuiZQ&list=PLRKq_yxxHw29-JcpG2CZ-xKK2U8Hw8O1t&index=2)
+* [Spack v1.0 overview](https://www.youtube.com/watch?v=nFksqSDNwQA&list=PLRKq_yxxHw29-JcpG2CZ-xKK2U8Hw8O1t&index=4)
+
+Introducing some of these features required us to make breaking changes. In most cases,
+we've also provided tools (in the form of Spack commands) that you can use to
+automatically migrate your packages and configuration.
+
+## Overview
+
+- [Overview](#overview)
+- [Stable Package API](#stable-package-api)
+    - [Separate Package Repository](#separate-package-repository)
+    - [Updating and Pinning Packages](#updating-and-pinning-packages)
+    - [Breaking changes related to package repositories](#breaking-changes-related-to-package-repositories)
+    - [Migrating to the new package API](#migrating-to-the-new-package-api)
+- [Compiler dependencies](#compiler-dependencies)
+    - [Compiler configuration](#compiler-configuration)
+    - [Languages are virtual dependencies](#languages-are-virtual-dependencies)
+    - [The meaning of % has changed](#the-meaning-of-%25-has-changed)
+    - [Virtual assignment syntax](#virtual-assignment-syntax)
+    - [Toolchains](#toolchains)
+    - [Ordering of variants and compilers now matters](#ordering-of-variants-and-compilers-now-matters)
+- [Additional Major Features](#additional-major-features)
+    - [Concurrent Package Builds](#concurrent-package-builds)
+    - [Content-addressed build caches](#content-addressed-build-caches)
+    - [Better provenance and mirroring for git](#better-provenance-and-mirroring-for-git)
+    - [Environment variables in environments](#environment-variables-in-environments)
+    - [Better include functionality](#better-include-functionality)
+- [New commands and options](#new-commands-and-options)
+- [Notable refactors](#notable-refactors)
+- [Documentation](#documentation)
+- [Notable Bugfixes](#notable-bugfixes)
+- [Additional deprecations, removals, and breaking changes](#additional-deprecations-removals-and-breaking-changes)
+- [Spack community stats](#spack-community-stats)
+
+## Stable Package API
+
+In Spack `v1.0`, the package repository is separate from the Spack tool, giving you more
+control over the versioning of package recipes. There is also a stable
+[Package API](https://spack.readthedocs.io/en/latest/package_api.html) that is versioned
+separately from Spack.
+
+This release of Spack supports package API from `v1.0` up to `v2.2`. The older `v1.0`
+package API is deprecated and may be removed in a future release, but we are
+guaranteeing that any Spack `v1.x` release will be backward compatible with Package API
+`v.2.x` -- i.e., it can execute code from the packages in *this* Spack release.
+
+See the
+[Package API Documentation](https://spack.readthedocs.io/en/latest/package_api.html) for
+full details on package versioning and compatibility. The high level details are:
+
+  1. The `spack.package` Python module defines the Package API;
+  2. The Package API *minor version* is incremented when new functions or classes are exported from `spack.package`; and
+  3. The major version is incremented when functions or classes are removed or have breaking changes to their signatures (a rare occurrence).
+
+This independent versioning allows package authors to utilize new Spack features without
+waiting for a new Spack release. Older Spack packages (API `v1.0`) may import code from
+outside of `spack.package`, e.g., from `spack.*` or `llnl.util.*`. This is deprecated
+and *not* included in the API guarantee. We will remove support for these packages in a
+future Spack release.
+
+### Separate Package Repository
+
+The Spack `builtin` package repository no longer lives in the Spack git repository. You
+can find it here:
+
+* https://github.com/spack/spack-packages
+
+Spack clones the package repository automatically when you first run, so you do not have
+to manage this manually. By default, Spack version `v1.0` uses the `v2025.07` release of
+`spack-packages`. You can find out more about it by looking at the
+[package releases](https://github.com/spack/spack-packages/releases).
+
+Downloaded package repos are stored by default within `~/.spack`, but the fetch
+destination can be configured. (#50650). If you want your package repository to live
+somewhere else, run, e.g.:
+
+```
+spack repo set --destination ~/spack-packages builtin
+```
+
+You can also configure your *own* package repositories to be fetched automatically from
+git urls, just as you can with `builtin`. See the
+[repository configuration docs](https://spack.readthedocs.io/en/latest/repositories.html)
+for details.
+
+### Updating and Pinning Packages
+
+You can tell Spack to update the core package repository from a branch. For example, on
+`develop` or on a release, you can run commands like:
+
+  ```shell
+  # pull the latest packages
+  spack repo update
+  ```
+or
+
+  ```shell
+  # check out a specific commit of the spack-packages repo
+  spack repo update --commit 2bf4ab9585c8d483cc8581d65912703d3f020393 builtin
+  ```
+
+which will set up your configuration like this:
+
+  ```yaml
+  repos:
+    builtin:
+      git: "https://github.com/spack/spack-packages.git"
+      commit: 2bf4ab9585c8d483cc8581d65912703d3f020393
+  ```
+
+You can use this within an environment to pin a specific version of its package files.
+See the
+[repository configuration docs](https://spack.readthedocs.io/en/latest/repositories.html)
+for more details (#50868, #50997, #51021).
+
+### Breaking changes related to package repositories
+
+1. The builtin repo now lives in `var/spack/repos/spack_repo/builtin` instead of
+   `var/spack/repos/builtin`, and it has a new layout, which you can learn about in the
+   [repo docs](https://spack.readthedocs.io/en/latest/repositories.html).
+
+2. The module `spack.package` no longer exports the following symbols, mostly related to
+   build systems: `AspellDictPackage`, `AutotoolsPackage`, `BundlePackage`,
+   `CachedCMakePackage`, `cmake_cache_filepath`, `cmake_cache_option`,
+   `cmake_cache_path`, `cmake_cache_string`, `CargoPackage`, `CMakePackage`,
+   `generator`, `CompilerPackage`, `CudaPackage`, `Package`, `GNUMirrorPackage`,
+   `GoPackage`, `IntelPackage`, `IntelOneApiLibraryPackageWithSdk`,
+   `IntelOneApiLibraryPackage`, `IntelOneApiStaticLibraryList`, `IntelOneApiPackage`,
+   `INTEL_MATH_LIBRARIES`, `LuaPackage`, `MakefilePackage`, `MavenPackage`,
+   `MesonPackage`, `MSBuildPackage`, `NMakePackage`, `OctavePackage`, `PerlPackage`,
+   `PythonExtension`, `PythonPackage`, `QMakePackage`, `RacketPackage`, `RPackage`,
+   `ROCmPackage`, `RubyPackage`, `SConsPackage`, `SIPPackage`, `SourceforgePackage`,
+   `SourcewarePackage`, `WafPackage`, `XorgPackage`
+
+   These are now part of the `builtin` package repository, not part of core spack or its
+   package API. When using repositories with package API `v2.0` and higher, *you must
+   explicitly import these package classes* from the appropriate module in
+   `spack_repo.builtin.build_systems` (see #50452 for more).
+
+   e.g., for `CMakePackage`, you would write:
+
+     ```python
+     from spack_repo.builtin.build_systems.cmake import CMakePackage
+     ```
+
+   Note that `GenericBuilder` and `Package` *are* part of the core package API. They are
+   currently re-exported from `spack_repo.builtin.build_systems.generic` for backward
+   compatibility but may be removed from the package repo. You should prefer to import
+   them from `spack.package`.
+
+   The original names will still work for old-style (`v1.0`) package repositories but
+   *not* in `v2.0` package repositories. Note that this means that the API stability
+   promise does *not* include old-style package repositories. They are deprecated and
+   will be removed in a future version. So, you should update as soon as you can.
+
+3. Package directory names within `v2.0` repositories are now valid Python modules
+
+    | Old                   | New                   | Description                         |
+    |-----------------------|-----------------------|-------------------------------------|
+    | `py-numpy/package.py` | `py_numpy/package.py` | hyphen is replaced by underscore.   |
+    | `7zip/package.py`     | `_7zip/package.py`    | leading digits now preceded by _    |
+    | `pass/package.py`     | `_pass/package.py`    | Python reserved words preceded by _ |
+
+
+4. Spack has historically injected `import` statements into package recipes, so there
+   was no need to use `from spack.package import *` (though we have included it in
+   `builtin` packages for years. `from spack.package import *` (or more specific
+   imports) will be necessary in packages. The magic we added in the early days of Spack
+   was causing IDEs, code editors, and other tools not to be able to understand Spack
+   packages. Now they use standard Python import semantics and should be compatible with
+   modern Python tooling. This change was also necessary to support Python 3.13. (see
+   #47947 for more details).
+
+### Migrating to the new package API
+
+Support will remain in place for the old repository layout for *at least a year*, so
+that you can continue to use old-style repos in conjunction with earlier versions. If
+you have custom repositories that need to migrate to the new layout, you can upgrade
+them to package API `v2.x` by running:
+
+```
+spack repo migrate
+```
+
+This will make the following changes to your repository:
+
+   1. If you used to import from `spack.pkg.builtin` in Python, you now need to import
+      from `spack_repo.builtin` instead:
+
+       ```python
+       # OLD: no longer supported
+       from spack.pkg.builtin.my_pkg import MyPackage
+
+       # NEW: spack_repo is a Python namespace package
+       from spack_repo.builtin.packages.my_pkg.package import MyPackage
+       ```
+   2. Normalized directory names for packages
+   3. New-style `spack.package` imports
+
+See #50507, #50579, and #50594 for more.
+
+## Compiler dependencies
+
+Prior to `v1.0`, compilers in Spack were attributes on nodes in the spec graph, with a
+name and a version (e.g., `gcc@12.0.0`). In `v1.0` compilers are packages like any other
+package in Spack (see #45189). This means that they can have variants, targets, and
+other attributes that regular nodes have.
+
+Here, we list the major changes that users should be aware of for this new model.
+
+### Compiler configuration
+
+In Spack `v1.0`, `compilers.yaml` is deprecated. `compilers.yaml` is still read by
+Spack, if present. We will continue to support this for at least a year, but we may
+remove it after that. Users are encouraged to migrate their configuration to use
+`packages.yaml` instead.
+
+Old style `compilers.yaml` specification:
+
+```yaml
+compilers:
+  - compiler:
+      spec: gcc@12.3.1
+      paths:
+         c: /usr/bin/gcc
+         cxx: /usr/bin/g++
+         fc: /usr/bin/gfortran
+       modules: [...]
+```
+
+New style `packages.yaml` compiler specification:
+
+```yaml
+packages:
+  gcc:
+    externals:
+    - spec: gcc@12.3.1+binutils
+      prefix: /usr
+      extra_attributes:
+        compilers:
+          c: /usr/bin/gcc
+          cxx: /usr/bin/g++
+          fc: /usr/bin/gfortran
+        modules: [...]
+```
+
+See
+[Configuring Compilers](https://spack.readthedocs.io/en/latest/configuring_compilers.html)
+for more details.
+
+
+### Languages are virtual dependencies
+
+Packages that need a C, C++, or Fortran compiler now **must** depend on `c`, `cxx`, or
+`fortran` as a build dependency, e.g.:
+
+```python
+class MyPackage(Package):
+    depends_on("c", type="build")
+    depends_on("cxx", type="build")
+    depends_on("fortran", type="build")
+```
+
+Historically, Spack assumed that *every* package was compiled with C, C++, and Fortran.
+In Spack `v1.0`, we allow packages to simply not have a compiler if they do not need
+one. For example, pure Python packages would not depend on any of these, and you should
+not add these dependencies to packages that do not need them.
+
+[Spack `v0.23`](https://github.com/spack/spack/releases/tag/v0.23.0) introduced language
+virtual dependencies, and we have back-ported them to `0.21.3` and `v0.22.2`. In pre-1.0
+Spack releases, these are a no-op. They are present so that language dependencies do not
+cause an error. This allows you to more easily use older Spack versions together with
+`v1.0`.
+
+See #45217 for more details.
+
+### The meaning of `%` has changed
+
+In Spack `v0.x`, `%` specified a compiler with a name and an optional version. In Spack
+`v1.0`, it simply means "direct dependency". It is similar to the caret `^`, which means
+"direct *or* transitive dependency".
+
+Unlike `^`, which specifies a dependency that needs to be unified for the whole graph,
+`%` can specify direct dependencies of particular nodes. This means you can use it to
+mix and match compilers, or `cmake` versions, or any other package for which *multiple*
+versions of the same build dependency are needed in the same graph. For example, in this
+spec:
+
+```
+foo ^hdf5 %cmake@3.1.2 ^zlib-ng %cmake@3.2.4
+```
+
+`hdf5` and `zlib-ng` are both transitive dependencies of `foo`, but `hdf5` will be built
+with `cmake@3.1.2` and `zlib-ng` will be built with `%cmake@3.2.4`. This is similar to
+mixing compilers, but you can now use `%` with other types of build dependencies, as
+well. You can have multiple versions of packages in the same graph, as long as they are
+purely build dependencies.
+
+### Virtual assignment syntax
+
+You can still specify compilers with `foo %gcc`, in which case `gcc` will be used to
+satisfy any `c`, `cxx`, and `fortran` dependencies of `foo`, but you can also be
+specific about the compiler that should be used for each language. To mix, e.g., `clang`
+and `gfortran`, you can now use *virtual assignment* like so:
+
+```console
+spack install foo %c,cxx=gcc %fortran=gfortran
+```
+
+This says to use `gcc` for `c` and `cxx`, and `gfortran` for `fortran`.
+It is functionally equivalent to the already supported edge attribute syntax:
+
+```
+spack install foo %[virtuals=c,cxx] gcc %[virtuals=fortran] gfortran
+```
+
+But, virtual assignment is more legible. We use it as the default formatting for virtual
+edge attributes, and we print it in the output of `spack spec`, `spack find`, etc. For
+example:
+
+```console
+> spack spec zlib
+ -   zlib@1.3.1+optimize+pic+shared build_system=makefile arch=darwin-sequoia-m1 %c,cxx=apple-clang@16.0.0
+[e]      ^apple-clang@16.0.0 build_system=bundle arch=darwin-sequoia-m1
+ -       ^compiler-wrapper@1.0 build_system=generic arch=darwin-sequoia-m1
+[+]      ^gmake@4.4.1~guile build_system=generic arch=darwin-sequoia-m1 %c=apple-clang@16.0.0
+[+]          ^compiler-wrapper@1.0 build_system=generic arch=darwin-sequoia-m1
+```
+
+You can see above that only `zlib` and `gmake` are compiled, and `gmake` uses only `c`.
+The other nodes are either external, and we cannot detect the compiler (`apple-clang`)
+or they are not compiled (`compiler-wrapper` is a shell script).
+
+### Toolchains
+
+Spack now has a concept of a "toolchain", which can be configured in `toolchains.yaml`.
+A toolchain is an alias for common dependencies, flags, and other spec properties that
+you can attach to a node in a graph with `%`.
+
+Toolchains are versatile and composable as they are simply aliases for regular specs.
+You can use them to represent mixed compiler combinations, compiler/MPI/numerical
+library groups, particular runtime libraries, and flags -- all to be applied together.
+This allows you to do with compiler dependencies what we used to do with
+`compilers.yaml`, and more.
+
+Example mixed clang/gfortran toolchain:
+
+```yaml
+toolchains:
+  clang_gfortran:
+    - spec: %c=clang
+      when: %c
+    - spec: %cxx=clang
+      when: %cxx
+    - spec: %fortran=gcc
+      when: %fortran
+    - spec: cflags="-O3 -g"
+    - spec: cxxflags="-O3 -g"
+    - spec: fflags="-O3 -g"
+```
+
+This enables you to write `spack install foo %clang_gfortran`, and Spack will resolve
+the `%clang_gfortran` toolchain to include the dependencies and flags listed in
+`toolchains.yaml`.
+
+You could also couple the intel compilers with `mvapich2` like so:
+
+```yaml
+toolchains:
+  intel_mvapich2:
+    - spec: %c=intel-oneapi-compilers @2025.1.1
+      when: %c
+    - spec: %cxx=intel-oneapi-compilers @2025.1.1
+      when: %cxx
+    - spec: %fortran=intel-oneapi-compilers @2025.1.1
+      when: %fortran
+    - spec: %mpi=mvapich2 @2.3.7-1 +cuda
+      when: %mpi
+```
+
+The `when:` conditions here ensure that toolchain constraints are only applied when
+needed. See the
+[toolchains documentation](https://spack.readthedocs.io/en/latest/advanced_topics.html#defining-and-using-toolchains)
+or #50481 for details.
+
+### Ordering of variants and compilers now matters
+
+In Spack `v0.x`, these two specs parse the same:
+
+```
+pkg %gcc +foo
+pkg +foo %gcc
+```
+
+The `+foo` variant applies to `pkg` in either case. In Spack `v1.0`, there is a breaking
+change, and `+foo` in `pkg %gcc +foo` now applies to `gcc`, since `gcc` is a normal
+package. This ensures we have the following symmetry:
+
+```
+pkg +foo %dep +bar  # `pkg +foo` depends on `dep +bar` directly
+pkg +foo ^dep +bar  # `pkg +foo` depends on `dep +bar` directly or transitively
+```
+
+In Spack `v1.0` you may get errors at concretization time if `+foo` is not a variant of
+`gcc` in specs like`%pkg %gcc +foo`.
+
+You can use the `spack style --spec-strings` command to update `package.py` files,
+`spack.yaml` files:
+
+  ```shell
+  # dry run
+  spack style --spec-strings $(git ls-files)  # if you have a git repo
+  spack style --spec-strings spack.yaml  # environments
+  ```
+
+  ```shell
+  # use --fix to perform the changes listed by the dry run
+  spack style --fix --spec-strings $(git ls-files)
+  spack style --fix --spec-strings spack.yaml
+  ```
+
+  See #49808, #49438, #49439 for details.
+
+## Additional Major Features
+
+### Concurrent Package Builds
+
+This release has completely reworked Spack's build scheduler, and it adds a `-p`/
+`--concurrent-packages` argument to `spack install`, which can greatly accelerate builds
+with many packages. You can use it in combination with `spack install -j`. For example,
+this command:
+
+```
+spack install -p 4 -j 16
+```
+
+runs up to 4 package builds at once, each with up to 16 make jobs. The default for
+`--concurrent-packages` is currently 1, so you must enable this feature yourself, either
+on the command line or by setting `config:concurrent_packages` (#50856):
+
+```yaml
+config:
+  concurrent_packages: 1
+```
+
+As before, you can run `spack install` on multiple nodes in a cluster, if the filesystem
+where Spack's `install_tree` is located supports locking.
+
+We will make concurrent package builds the default in `1.1`, when we plan to include
+support for `gmake`'s jobserver protocol and for line-synced output. Currently, setting
+`-p` higher than 1 can make Spack's output difficult to read.
+
+### Content-addressed build caches
+
+Spack `v1.0` changes the format of build caches to address a number of scaling and
+consistency issues with our old (aging) buildcache layout. The new buildcache format is
+content-addressed and enables us to make many operations atomic (and therefore safer).
+It is also more extensible than the old buildcache format and can enable features like
+split debug info and different signing methods in the future. See #48713 for more
+details.
+
+Spack `v1.0` can still read, but not write to, the old build caches. The new build cache
+format is *not* backward compatible with the old format, *but* you can have a new build
+cache and an old build cache coexist beside each other. If you push to an old build
+cache, new binaries will start to show up in the new format.
+
+You can migrate an old buildcache to the new format using the `spack buildcache migrate`
+command. It is nondestructive and can migrate an old build cache to a new one in-place.
+That is, it creates the new buildcache within the same directory, alongside the old
+buildcache.
+
+As with other major changes, the old buildcache format is deprecated in `v1.0`, but will
+not be removed for at least a year.
+
+### Better provenance and mirroring for git
+
+Spack now resolves and preserves the commit of any git-based version at concretization
+time, storing the precise commit built on the Spec in a reserved `commit` variant. This
+allows us to better reproduce git builds. See #48702 for details.
+
+Historically, Spack has only stored the ref name, e.g. the branch or tag, for git
+versions that did not already contain full commits. Now we can know exactly what was
+built regardless of how it was fetched.
+
+As a consequence of this change, mirroring git repositories is also more robust. See
+#50604, #50906 for details.
+
+### Environment variables in environments
+
+You can now specify environment variables in your environment that should be set on
+activation (and unset on deactivation):
+
+```yaml
+spack:
+  specs:
+    - cmake%gcc
+  env_vars:
+    set:
+      MY_FAVORITE_VARIABLE: "TRUE"
+```
+
+The syntax allows the same modifications that are allowed for modules: `set:`, `unset:`,
+`prepend_path:`, `append_path:`, etc.
+
+See [the docs](https://spack.readthedocs.io/en/latest/env_vars_yaml.html or #47587 for more.
+
+### Better include functionality
+
+Spack allows you to include local or remote configuration files through `include.yaml`,
+and includes can be optional (i.e. include them only if they exist) or conditional (only
+include them under certain conditions:
+
+```yaml
+spack:
+  include:
+  - /path/to/a/required/config.yaml
+  - path: /path/to/$os/$target/config
+    optional: true
+  - path: /path/to/os-specific/config-dir
+    when: os == "ventura"
+```
+
+You can use this in an environment, or in an `include.yaml` in an existing configuration
+scope. Included configuration files are required *unless* they are explicitly optional
+or the entry's condition evaluates to `false`. Optional includes are specified with the
+`optional` clause and conditional ones with the ``when`` clause.
+
+Conditionals use the same syntax as
+[spec list references](https://spack.readthedocs.io/en/latest/environments.html#spec-list-references)
+The [docs on `include.yaml`](https://spack.readthedocs.io/en/latest/include_yaml.html)
+have more information. You can also look at #48784.
+
+
+## New commands and options
+* `spack repo update` will pull the latest packages (#50868, #50997)
+* `spack style --spec-strings` fixes old configuration file and packages (#49485)
+* `spack repo migrate`: migrates old repositories to the new layout (#50507)
+* `spack ci` no longer has a `--keep-stage` flag (#49467)
+* The new `spack config scopes` subcommand will list active configuration scopes (#41455, #50703)
+* `spack cd --repo <namespace>` (#50845)
+* `spack location --repo <namespace>` (#50845)
+* `--force` is now a common argument for all commands that do concretization (#48838)
+
+## Notable refactors
+
+* All of Spack is now in one top-level `spack` Python package
+  * The `spack_installable` package is gone as it's no longer needed (#50996)
+  * The top-level `llnl` package has been moved to `spack.llnl` and will likely be
+    refactored more later (#50989)
+  * Vendored dependencies that were previously in `_vendoring` are now in `spack.vendor` (#51005)
+
+* Increased determinism when generating inputs for the ASP solver, leading to more
+  consistent concretization results (#49471)
+
+* Added fast, stable spec comparison, which also increases determinism of concretizer
+  inputs, and more consistent results (#50625)
+
+* Test deps are now part of the DAG hash, so builds with tests enabled will (correctly)
+  have different hashes from builds without tests enabled (#48936)
+
+* `spack spec` in an environment or on the command line will show unified output with
+  the specs provided as roots (#47574)
+
+* users can now set a timeout in `concretizer.yaml` in case they frequently hit long
+  solves (#47661)
+
+* GoPackage: respect `-j`` concurrency (#48421)
+
+* We are using static analysis to speed up concretization (#48729)
+
+## Documentation
+
+We have overhauled a number of sections of the documentation.
+
+* The basics section of the documentation has been reorganized and updated (#50932)
+
+* The [packaging guide](https://spack.readthedocs.io/en/latest/packaging_guide_creation.html)
+  has been rewritten and broken into four separate, logically ordered sections (#50884).
+
+* As mentioned above the entire
+  [`spack.package` API](https://spack.readthedocs.io/en/latest/package_api.html) has
+  been documented and consolidated to one package (#51010)
+
+## Notable Bugfixes
+
+* A race that would cause timeouts in certain parallel builds has been fixed. Every
+  build now stages its own patches and cannot fight over them (causing a timeout) with
+  other builds (#50697)
+* The `command_line` scope is now *always* the top level. Previously environments could
+  override command line settings (#48255)
+* `setup-env.csh` is now hardened to avoid conflicts with user aliases (#49670)
+
+## Additional deprecations, removals, and breaking changes
+
+1. `spec["pkg"]` searches only direct dependencies and transitive link/run dependencies,
+   ordered by depth. This avoids situations where we pick up unwanted deps of build/test
+   deps. To reach those, you need to do `spec["build_dep"]["pkg"]` explicitly (#49016).
+
+2. `spec["mpi"]` no longer works to refer to `spec` itself on specs like `openmpi` and
+   `mpich` that could provide `mpi`. We only find `"mpi"` if it is provided by some
+   dependency (see #48984).
+
+3. We have removed some long-standing internal API methods on `spack.spec.Spec` so that
+   we can decouple internal modules in the Spack code. `spack.spec` was including too
+   many different parts of Spack.
+  * `Spec.concretize()` and `Spec.concretized()` have been removed. Use
+    `spack.concretize.concretize_one(spec)` instead (#47971, #47978)
+  * `Spec.is_virtual`` is now spack.repo.PATH.is_virtual (#48986)
+  * `Spec.virtual_dependencies` has been removed (#49079)
+
+4. #50603: Platform config scopes are now opt-in. If you want to use subdirectories like
+   `darwin` or `linux` in your scopes, you'll need to include them explicitly in an
+   `include.yaml` or in your `spack.yaml` file, like so:
+
+    ```yaml
+    include:
+      - include: "${platform}"
+        optional: true
+    ```
+
+5. #48488, #48502: buildcache entries created with Spack 0.19 and older using `spack
+   buildcache create --rel` will no longer be relocated upon install. These old binaries
+   should continue to work, except when they are installed with different
+   `config:install_tree:projections` compared to what they were built with. Similarly,
+   buildcache entries created with Spack 0.15 and older that contain long shebang lines
+   wrapped with sbang will no longer be relocated.
+
+6. #50462: the `package.py` globals `std_cmake_args`, `std_pip_args`, `std_meson_args`
+   were removed. They were deprecated in Spack 0.23. Use `CMakeBuilder.std_args(pkg)`,
+   `PythonPipBuilder.std_args(pkg)` and `MesonBuilder.std_args(pkg)` instead.
+
+7. #50605, #50616: If you were using `update_external_dependencies()` in your private
+   packages, note that it is going away in 1.0 to get it out of the package API. It is
+   instead being moved into the concretizer, where it can change in the future, when we
+   have a better way to deal with dependencies of externals, without breaking the
+   package API. We suspect that nobody was doing this, but it's technically a breaking
+   change.
+
+8. #48838: Two breaking command changes:
+    * `spack install` no longer has a `-f` / `--file` option --
+      write `spack install ./path/to/spec.json` instead.
+    * `spack mirror create` no longer has a short `-f` option --
+      use `spack mirror create --file` instead.
+
+9. We no longer support the PGI compilers. They have been replaced by `nvhpc` (#47195)
+
+10. Python 3.8 is deprecated in the Python package, as it is EOL (#46913)
+
+11. The `target=fe` / `target=frontend` and `target=be` / `target=backend` targets from
+    Spack's orignal compilation model for cross-compiled Cray and BlueGene systems are
+    now deprecated (#47756)
+
+## Spack community stats
+
+* 2,276 commits updated package recipes
+* 8,499 total packages, 214 new since v0.23.0
+* 372 people contributed to this release
+* 363 committers to packages
+* 63 committers to core
+
+
+# v0.23.1 (2025-02-19)
+
+## Bugfixes
+- Fix a correctness issue of `ArchSpec.intersects` (#48741)
+- Make `extra_attributes` order independent in Spec hashing (#48615, #48854)
+- Fix issue where system proxy settings were not respected in OCI build caches (#48783)
+- Fix an issue where the `--test` concretizer flag was not forwarded correctly (#48417)
+- Fix an issue where `codesign` and `install_name_tool` would not preserve hardlinks on
+  Darwin (#47808)
+- Fix an issue on Darwin where codesign would run on unmodified binaries (#48568)
+- Patch configure scripts generated with libtool < 2.5.4, to avoid redundant flags when
+  creating shared libraries on Darwin (#48671)
+- Fix issue related to mirror URL paths on Windows (#47898)
+- Esnure proper UTF-8 encoding/decoding in logging (#48005)
+- Fix issues related to `filter_file` (#48038, #48108)
+- Fix issue related to creating bootstrap source mirrors (#48235)
+- Fix issue where command line config arguments were not always top level (#48255)
+- Fix an incorrect typehint of `concretized()` (#48504)
+- Improve mention of next Spack version in warning (#47887)
+- Tests: fix forward compatibility with Python 3.13 (#48209)
+- Docs: encourage use of `--oci-username-variable` and `--oci-password-variable` (#48189)
+- Docs: ensure Getting Started has bootstrap list output in correct place (#48281)
+- CI: allow GitHub actions to run on forks of Spack with different project name (#48041)
+- CI: make unit tests work on Ubuntu 24.04 (#48151)
+- CI: re-enable cray pipelines (#47697)
+
+## Package updates
+- `qt-base`: fix rpath for dependents (#47424)
+- `gdk-pixbuf`: fix outdated URL (#47825)
+
+
+# v0.23.0 (2024-11-13)
+
+`v0.23.0` is a major feature release.
+
+We are planning to make this the last major release before Spack `v1.0`
+in June 2025. Alongside `v0.23`, we will be making pre-releases (alpha,
+beta, etc.)  of `v1.0`, and we encourage users to try them and send us
+feedback, either on GitHub or on Slack. You can track the road to
+`v1.0` here:
+
+  * https://github.com/spack/spack/releases
+  * https://github.com/spack/spack/discussions/30634
+
+## Features in this Release
+
+1. **Language virtuals**
+
+   Your packages can now explicitly depend on the languages they require.
+   Historically, Spack has considered C, C++, and Fortran compiler
+   dependencies to be implicit. In `v0.23`, you should ensure that
+   new packages add relevant C, C++, and Fortran dependencies like this:
+
+   ```python
+   depends_on("c", type="build")
+   depends_on("cxx", type="build")
+   depends_on("fortran", type="build")
+   ```
+
+   We encourage you to add these annotations to your packages now, to prepare
+   for Spack `v1.0.0`. In `v1.0.0`, these annotations will be necessary for
+   your package to use C, C++, and Fortran compilers. Note that you should
+   *not* add language dependencies to packages that don't need them, e.g.,
+   pure python packages.
+
+   We have already auto-generated these dependencies for packages in the
+   `builtin` repository (see #45217), based on the types of source files
+   present in each package's source code. We *may* have added too many or too
+   few language dependencies, so please submit pull requests to correct
+   packages if you find that the language dependencies are incorrect.
+
+   Note that we have also backported support for these dependencies to
+   `v0.21.3` and `v0.22.2`, to make all of them forward-compatible with
+   `v0.23`. This should allow you to move easily between older and newer Spack
+   releases without breaking your packages.
+
+2. **Spec splicing**
+
+   We are working to make binary installation more seamless in Spack. `v0.23`
+   introduces "splicing", which allows users to deploy binaries using local,
+   optimized versions of a binary interface, even if they were not built with
+   that interface. For example, this would allow you to build binaries in the
+   cloud using `mpich` and install them on a system using a local, optimized
+   version of `mvapich2` *without rebuilding*. Spack preserves full provenance
+   for the installed packages and knows that they were built one way but
+   deployed another.
+
+   Our intent is to leverage this across many key HPC binary packages,
+   e.g. MPI, CUDA, ROCm, and libfabric.
+
+   Fundamentally, splicing allows Spack to redeploy an existing spec with
+   different dependencies than how it was built. There are two interfaces to
+   splicing.
+
+   a. Explicit Splicing
+
+      #39136 introduced the explicit splicing interface. In the
+      concretizer config, you can specify a target spec and a replacement
+      by hash.
+
+      ```yaml
+      concretizer:
+        splice:
+          explicit:
+          - target: mpi
+            replacement: mpich/abcdef
+      ```
+
+      Here, every installation that would normally use the target spec will
+      instead use its replacement. Above, any spec using *any* `mpi` will be
+      spliced to depend on the specific `mpich` installation requested. This
+      *can* go wrong if you try to replace something built with, e.g.,
+      `openmpi` with `mpich`, and it is on the user to ensure ABI
+      compatibility between target and replacement specs. This currently
+      requires some expertise to use, but it will allow users to reuse the
+      binaries they create across more machines and environments.
+
+   b. Automatic Splicing (experimental)
+
+      #46729 introduced automatic splicing. In the concretizer config, enable
+      automatic splicing:
+
+      ```yaml
+      concretizer:
+        splice:
+          automatic: true
+      ```
+
+      or run:
+
+      ```console
+      spack config add concretizer:splice:automatic:true
+      ```
+
+      The concretizer will select splices for ABI compatibility to maximize
+      package reuse. Packages can denote ABI compatibility using the
+      `can_splice` directive. No packages in Spack yet use this directive, so
+      if you want to use this feature you will need to add `can_splice`
+      annotations to your packages. We are working on ways to add more ABI
+      compatibility information to the Spack package repository, and this
+      directive may change in the future.
+
+   See the documentation for more details:
+   * https://spack.readthedocs.io/en/latest/build_settings.html#splicing
+   * https://spack.readthedocs.io/en/latest/packaging_guide.html#specifying-abi-compatibility
+
+3. Broader variant propagation
+
+   Since #42931, you can specify propagated variants like `hdf5
+   build_type==RelWithDebInfo` or `trilinos ++openmp` to propagate a variant
+   to all dependencies for which it is relevant. This is valid *even* if the
+   variant does not exist on the package or its dependencies.
+
+   See https://spack.readthedocs.io/en/latest/basic_usage.html#variants.
+
+4. Query specs by namespace
+
+   #45416 allows a package's namespace (indicating the repository it came from)
+   to be treated like a variant. You can request packages from particular repos
+   like this:
+
+   ```console
+   spack find zlib namespace=builtin
+   spack find zlib namespace=myrepo
+   ```
+
+   Previously, the spec syntax only allowed namespaces to be prefixes of spec
+   names, e.g. `builtin.zlib`. The previous syntax still works.
+
+5. `spack spec` respects environment settings and `unify:true`
+
+   `spack spec` did not previously respect environment lockfiles or
+   unification settings, which made it difficult to see exactly how a spec
+   would concretize within an environment. Now it does, so the output you get
+   with `spack spec` will be *the same* as what your environment will
+   concretize to when you run `spack concretize`. Similarly, if you provide
+   multiple specs on the command line with `spack spec`, it will concretize
+   them together if `unify:true` is set.
+
+   See #47556 and #44843.
+
+6. Less noisy `spack spec` output
+
+   `spack spec` previously showed output like this:
+
+   ```console
+    > spack spec /v5fn6xo
+    Input spec
+    --------------------------------
+     -   /v5fn6xo
+
+    Concretized
+    --------------------------------
+    [+]  openssl@3.3.1%apple-clang@16.0.0~docs+shared arch=darwin-sequoia-m1
+    ...
+   ```
+
+   But the input spec is redundant, and we know we run `spack spec` to concretize
+   the input spec. `spack spec` now *only* shows the concretized spec. See #47574.
+
+7. Better output for `spack find -c`
+
+   In an environmnet, `spack find -c` lets you search the concretized, but not
+   yet installed, specs, just as you would the installed ones. As with `spack
+   spec`, this should make it easier for you to see what *will* be built
+   before building and installing it. See #44713.
+
+8. `spack -C <env>`: use an environment's configuration without activation
+
+   Spack environments allow you to associate:
+   1. a set of (possibly concretized) specs, and
+   2. configuration
+
+   When you activate an environment, you're using both of these. Previously, we
+   supported:
+   * `spack -e <env>` to run spack in the context of a specific environment, and
+   * `spack -C <directory>` to run spack using a directory with configuration files.
+
+   You can now also pass an environment to `spack -C` to use *only* the environment's
+   configuration, but not the specs or lockfile. See #45046.
+
+## New commands, options, and directives
+
+* The new `spack env track` command (#41897) takes a non-managed Spack
+  environment and adds a symlink to Spack's `$environments_root` directory, so
+  that it will be included for reference counting for commands like `spack
+  uninstall` and `spack gc`. If you use free-standing directory environments,
+  this is useful for preventing Spack from removing things required by your
+  environments. You can undo this tracking with the `spack env untrack`
+  command.
+
+* Add `-t` short option for `spack --backtrace` (#47227)
+
+  `spack -d / --debug` enables backtraces on error, but it can be very
+  verbose, and sometimes you just want the backtrace. `spack -t / --backtrace`
+  provides that option.
+
+* `gc`: restrict to specific specs (#46790)
+
+  If you only want to garbage-collect specific packages, you can now provide
+  them on the command line. This gives users finer-grained control over what
+  is uninstalled.
+
+* oci buildcaches now support `--only=package`. You can now push *just* a
+  package and not its dependencies to an OCI registry. This allows dependents
+  of non-redistributable specs to be stored in OCI registries without an
+  error. See #45775.
+
+## Notable refactors
+* Variants are now fully conditional
+
+  The `variants` dictionary on packages was previously keyed by variant name,
+  and allowed only one definition of any given variant. Spack is now smart
+  enough to understand that variants may have different values and defaults
+  for different versions. For example, `warpx` prior to `23.06` only supported
+  builds for one dimensionality, and newer `warpx` versions could be built
+  with support for many different dimensions:
+
+  ```python
+  variant(
+      "dims",
+      default="3",
+      values=("1", "2", "3", "rz"),
+      multi=False,
+      description="Number of spatial dimensions",
+      when="@:23.05",
+  )
+  variant(
+      "dims",
+      default="1,2,rz,3",
+      values=("1", "2", "3", "rz"),
+      multi=True,
+      description="Number of spatial dimensions",
+      when="@23.06:",
+  )
+  ```
+
+  Previously, the default for the old version of `warpx` was not respected and
+  had to be specified manually. Now, Spack will select the right variant
+  definition for each version at concretization time. This allows variants to
+  evolve more smoothly over time. See #44425 for details.
+
+## Highlighted bugfixes
+
+1. Externals no longer override the preferred provider (#45025).
+
+   External definitions could interfere with package preferences. Now, if
+   `openmpi` is the preferred `mpi`, and an external `mpich` is defined, a new
+   `openmpi` *will* be built if building it is possible. Previously we would
+   prefer `mpich` despite the preference.
+
+2. Composable `cflags` (#41049).
+
+   This release fixes a longstanding bug that concretization would fail if
+   there were different `cflags` specified in `packages.yaml`,
+   `compilers.yaml`, or on `the` CLI. Flags and their ordering are now tracked
+   in the concretizer and flags from multiple sources will be merged.
+
+3. Fix concretizer Unification for included environments (#45139).
+
+## Deprecations, removals, and syntax changes
+
+1. The old concretizer has been removed from Spack, along with the
+   `config:concretizer` config option. Spack will emit a warning if the option
+   is present in user configuration, since it now has no effect. Spack now
+   uses a simpler bootstrapping mechanism, where a JSON prototype is tweaked
+   slightly to get an initial concrete spec to download. See #45215.
+
+2. Best-effort expansion of spec matrices has been removed. This feature did
+   not work with the "new" ASP-based concretizer, and did not work with
+   `unify: True` or `unify: when_possible`. Use the
+   [exclude key](https://spack.readthedocs.io/en/latest/environments.html#spec-matrices)
+   for the environment to exclude invalid components, or use multiple spec
+   matrices to combine the list of specs for which the constraint is valid and
+   the list of specs for which it is not. See #40792.
+
+3. The old Cray `platform` (based on Cray PE modules) has been removed, and
+   `platform=cray` is no longer supported. Since `v0.19`, Spack has handled
+   Cray machines like Linux clusters with extra packages, and we have
+   encouraged using this option to support Cray. The new approach allows us to
+   correctly handle Cray machines with non-SLES operating systems, and it is
+   much more reliable than making assumptions about Cray modules. See the
+   `v0.19` release notes and #43796 for more details.
+
+4. The `config:install_missing_compilers` config option has been deprecated,
+   and it is a no-op when set in `v0.23`. Our new compiler dependency model
+   will replace it with a much more reliable and robust mechanism in `v1.0`.
+   See #46237.
+
+5. Config options that deprecated in `v0.21` have been removed in `v0.23`. You
+   can now only specify preferences for `compilers`, `targets`, and
+   `providers` globally via the `packages:all:` section. Similarly, you can
+   only specify `versions:` locally for a specific package. See #44061 and
+   #31261 for details.
+
+6. Spack's old test interface has been removed (#45752), having been
+   deprecated in `v0.22.0` (#34236). All `builtin` packages have been updated
+   to use the new interface. See the [stand-alone test documentation](
+   https://spack.readthedocs.io/en/latest/packaging_guide.html#stand-alone-tests)
+
+7. The `spack versions --safe-only` option, deprecated since `v0.21.0`, has
+   been removed. See #45765.
+
+* The `--dependencies` and `--optimize` arguments to `spack ci` have been
+  deprecated. See #45005.
+
+## Binary caches
+1. Public binary caches now include an ML stack for Linux/aarch64 (#39666)We
+   now build an ML stack for Linux/aarch64 for all pull requests and on
+   develop. The ML stack includes both CPU-only and CUDA builds for Horovod,
+   Hugging Face, JAX, Keras, PyTorch,scikit-learn, TensorBoard, and
+   TensorFlow, and related packages. The CPU-only stack also includes XGBoost.
+   See https://cache.spack.io/tag/develop/?stack=ml-linux-aarch64-cuda.
+
+2. There is also now an stack of developer tools for macOS (#46910), which is
+   analogous to the Linux devtools stack. You can use this to avoid building
+   many common build dependencies. See
+   https://cache.spack.io/tag/develop/?stack=developer-tools-darwin.
+
+## Architecture support
+* archspec has been updated to `v0.2.5`, with support for `zen5`
+* Spack's CUDA package now supports the Grace Hopper `9.0a` compute capability (#45540)
+
+## Windows
+* Windows bootstrapping: `file` and `gpg` (#41810)
+* `scripts` directory added to PATH on Windows for python extensions (#45427)
+* Fix `spack load --list` and `spack unload` on Windows (#35720)
+
+## Other notable changes
+* Bugfix: `spack find -x` in environments (#46798)
+* Spec splices are now robust to duplicate nodes with the same name in a spec (#46382)
+* Cache per-compiler libc calculations for performance (#47213)
+* Fixed a bug in external detection for openmpi (#47541)
+* Mirror configuration allows username/password as environment variables (#46549)
+* Default library search caps maximum depth (#41945)
+* Unify interface for `spack spec` and `spack solve` commands (#47182)
+* Spack no longer RPATHs directories in the default library search path (#44686)
+* Improved performance of Spack database (#46554)
+* Enable package reuse for packages with versions from git refs (#43859)
+* Improved handling for `uuid` virtual on macos (#43002)
+* Improved tracking of task queueing/requeueing in the installer (#46293)
+
+## Spack community stats
+
+* Over 2,000 pull requests updated package recipes
+* 8,307 total packages, 329 new since `v0.22.0`
+    * 140 new Python packages
+    * 14 new R packages
+* 373 people contributed to this release
+    * 357 committers to packages
+    * 60 committers to core
+
+
+# v0.22.2 (2024-09-21)
+
+## Bugfixes
+- Forward compatibility with Spack 0.23 packages with language dependencies (#45205, #45191)
+- Forward compatibility with `urllib` from Python 3.12.6+ (#46453, #46483)
+- Bump vendored `archspec` for better aarch64 support (#45721, #46445)
+- Support macOS Sequoia (#45018, #45127)
+- Fix regression in `{variants.X}` and `{variants.X.value}` format strings (#46206)
+- Ensure shell escaping of environment variable values in load and activate commands (#42780)
+- Fix an issue where `spec[pkg]` considers specs outside the current DAG (#45090)
+- Do not halt concretization on unknown variants in externals (#45326)
+- Improve validation of `develop` config section (#46485)
+- Explicitly disable `ccache` if turned off in config, to avoid cache pollution (#45275)
+- Improve backwards compatibility in `include_concrete` (#45766)
+- Fix issue where package tags were sometimes repeated (#45160)
+- Make `setup-env.sh` "sourced only" by dropping execution bits (#45641)
+- Make certain source/binary fetch errors recoverable instead of a hard error (#45683)
+- Remove debug statements in package hash computation (#45235)
+- Remove redundant clingo warnings (#45269)
+- Remove hard-coded layout version (#45645)
+- Do not initialize previous store state in `use_store` (#45268)
+- Docs improvements (#46475)
+
+## Package updates
+- `chapel` major update (#42197, #44931, #45304)
+
+# v0.22.1 (2024-07-04)
+
+## Bugfixes
+- Fix reuse of externals on Linux (#44316)
+- Ensure parent gcc-runtime version >= child (#44834, #44870)
+- Ensure the latest gcc-runtime is rpath'ed when multiple exist among link deps (#44219)
+- Improve version detection of glibc (#44154)
+- Improve heuristics for solver (#44893, #44976, #45023)
+- Make strong preferences override reuse (#44373)
+- Reduce verbosity when C compiler is missing (#44182)
+- Make missing ccache executable an error when required (#44740)
+- Make every environment view containing `python` a `venv` (#44382)
+- Fix external detection for compilers with os but no target (#44156)
+- Fix version optimization for roots (#44272)
+- Handle common implementations of pagination of tags in OCI build caches (#43136)
+- Apply fetched patches to develop specs (#44950)
+- Avoid Windows wrappers for filesystem utilities on non-Windows (#44126)
+- Fix issue with long filenames in build caches on Windows (#43851)
+- Fix formatting issue in `spack audit` (#45045)
+- CI fixes (#44582, #43965, #43967, #44279, #44213)
+
+## Package updates
+- protobuf: fix 3.4:3.21 patch checksum (#44443)
+- protobuf: update hash for patch needed when="@3.4:3.21" (#44210)
+- git: bump v2.39 to 2.45; deprecate unsafe versions (#44248)
+- gcc: use -rpath {rpath_dir} not -rpath={rpath dir} (#44315)
+- Remove mesa18 and libosmesa (#44264)
+- Enforce consistency of `gl` providers (#44307)
+- Require libiconv for iconv (#44335, #45026).
+  Notice that glibc/musl also provide iconv, but are not guaranteed to be
+  complete. Set `packages:iconv:require:[glibc]` to restore the old behavior.
+- py-matplotlib: qualify when to do a post install (#44191)
+- rust: fix v1.78.0 instructions (#44127)
+- suite-sparse: improve setting of the `libs` property (#44214)
+- netlib-lapack: provide blas and lapack together (#44981)
+
+# v0.22.0 (2024-05-12)
+
+`v0.22.0` is a major feature release.
+
+## Features in this release
+
+1. **Compiler dependencies**
+
+    We are in the process of making compilers proper dependencies in Spack, and a number
+    of changes in `v0.22` support that effort. You may notice nodes in your dependency
+    graphs for compiler runtime libraries like `gcc-runtime` or `libgfortran`, and you
+    may notice that Spack graphs now include `libc`. We've also begun moving compiler
+    configuration from `compilers.yaml` to `packages.yaml` to make it consistent with
+    other externals. We are trying to do this with the least disruption possible, so
+    your existing `compilers.yaml` files should still work. We expect to be done with
+    this transition by the `v0.23` release in November.
+
+    * #41104: Packages compiled with `%gcc` on Linux, macOS and FreeBSD now depend on a
+      new package `gcc-runtime`, which contains a copy of the shared compiler runtime
+      libraries. This enables gcc runtime libraries to be installed and relocated when
+      using a build cache. When building minimal Spack-generated container images it is
+      no longer necessary to install libgfortran, libgomp etc. using the system package
+      manager.
+
+    * #42062: Packages compiled with `%oneapi` now depend on a new package
+      `intel-oneapi-runtime`. This is similar to `gcc-runtime`, and the runtimes can
+      provide virtuals and compilers can inject dependencies on virtuals into compiled
+      packages. This allows us to model library soname compatibility and allows
+      compilers like `%oneapi` to provide virtuals like `sycl` (which can also be
+      provided by standalone libraries). Note that until we have an agreement in place
+      with intel, Intel packages are marked `redistribute(source=False, binary=False)`
+      and must be downloaded outside of Spack.
+
+    * #43272: changes to the optimization criteria of the solver improve the hit-rate of
+      buildcaches by a fair amount. The solver more relaxed compatibility rules and will
+      not try to strictly match compilers or targets of reused specs. Users can still
+      enforce the previous strict behavior with `require:` sections in `packages.yaml`.
+      Note that to enforce correct linking, Spack will *not* reuse old `%gcc` and
+      `%oneapi` specs that do not have the runtime libraries as a dependency.
+
+    * #43539: Spack will reuse specs built with compilers that are *not* explicitly
+      configured in `compilers.yaml`. Because we can now keep runtime libraries in build
+      cache, we do not require you to also have a local configured compiler to *use* the
+      runtime libraries. This improves reuse in buildcaches and avoids conflicts with OS
+      updates that happen underneath Spack.
+
+    * #43190: binary compatibility on `linux` is now based on the `libc` version,
+      instead of on the `os` tag. Spack builds now detect the host `libc` (`glibc` or
+      `musl`) and add it as an implicit external node in the dependency graph. Binaries
+      with a `libc` with the same name and a version less than or equal to that of the
+      detected `libc` can be reused. This is only on `linux`, not `macos` or `Windows`.
+
+    * #43464: each package that can provide a compiler is now detectable using `spack
+      external find`. External packages defining compiler paths are effectively used as
+      compilers, and `spack external find -t compiler` can be used as a substitute for
+      `spack compiler find`. More details on this transition are in
+      [the docs](https://spack.readthedocs.io/en/latest/getting_started.html#manual-compiler-configuration)
+
+2. **Improved `spack find` UI for Environments**
+
+   If you're working in an environment, you likely care about:
+
+   * What are the roots
+   * Which ones are installed / not installed
+   * What's been added that still needs to be concretized
+
+    We've tweaked `spack find` in environments to show this information much more
+    clearly. Installation status is shown next to each root, so you can see what is
+    installed. Roots are also shown in bold in the list of installed packages. There is
+    also a new option for `spack find -r` / `--only-roots` that will only show env
+    roots, if you don't want to look at all the installed specs.
+
+    More details in #42334.
+
+3. **Improved command-line string quoting**
+
+   We are making some breaking changes to how Spack parses specs on the CLI in order to
+   respect shell quoting instead of trying to fight it. If you (sadly) had to write
+   something like this on the command line:
+
+    ```
+    spack install zlib cflags=\"-O2 -g\"
+    ```
+
+    That will now result in an error, but you can now write what you probably expected
+    to work in the first place:
+
+    ```
+    spack install zlib cflags="-O2 -g"
+    ```
+
+    Quoted can also now include special characters, so you can supply flags like:
+
+    ```
+    spack install zlib ldflags='-Wl,-rpath=$ORIGIN/_libs'
+    ```
+
+    To reduce ambiguity in parsing, we now require that you *not* put spaces around `=`
+    and `==` when for flags or variants. This would not have broken before but will now
+    result in an error:
+
+    ```
+    spack install zlib cflags = "-O2 -g"
+    ```
+
+    More details and discussion in #30634.
+
+4. **Revert default `spack install` behavior to `--reuse`**
+
+   We changed the default concretizer behavior from `--reuse` to `--reuse-deps` in
+   #30990 (in `v0.20`), which meant that *every* `spack install` invocation would
+   attempt to build a new version of the requested package / any environment roots.
+   While this is a common ask for *upgrading* and for *developer* workflows, we don't
+   think it should be the default for a package manager.
+
+   We are going to try to stick to this policy:
+   1. Prioritize reuse and build as little as possible by default.
+   2. Only upgrade or install duplicates if they are explicitly asked for, or if there
+      is a known security issue that necessitates an upgrade.
+
+   With the install command you now have three options:
+
+   * `--reuse` (default): reuse as many existing installations as possible.
+   * `--reuse-deps` / `--fresh-roots`: upgrade (freshen) roots but reuse dependencies if possible.
+   * `--fresh`: install fresh versions of requested packages (roots) and their dependencies.
+
+   We've also introduced `--fresh-roots` as an alias for `--reuse-deps` to make it more clear
+   that it may give you fresh versions. More details in #41302 and #43988.
+
+5. **More control over reused specs**
+
+   You can now control which packages to reuse and how. There is a new
+   `concretizer:reuse` config option, which accepts the following properties:
+
+   - `roots`: `true` to reuse roots, `false` to reuse just dependencies
+   - `exclude`: list of constraints used to select which specs *not* to reuse
+   - `include`: list of constraints used to select which specs *to* reuse
+   - `from`: list of sources for reused specs (some combination of `local`,
+     `buildcache`, or `external`)
+
+   For example, to reuse only specs compiled with GCC, you could write:
+
+   ```yaml
+   concretizer:
+      reuse:
+        roots: true
+        include:
+        - "%gcc"
+   ```
+
+   Or, if `openmpi` must be used from externals, and it must be the only external used:
+
+   ```yaml
+   concretizer:
+     reuse:
+       roots: true
+       from:
+       - type: local
+         exclude: ["openmpi"]
+       - type: buildcache
+         exclude: ["openmpi"]
+       - type: external
+         include: ["openmpi"]
+   ```
+
+6. **New `redistribute()` directive**
+
+   Some packages can't be redistributed in source or binary form. We need an explicit
+   way to say that in a package.
+
+   Now there is a `redistribute()` directive so that package authors can write:
+
+   ```python
+   class MyPackage(Package):
+       redistribute(source=False, binary=False)
+   ```
+
+   Like other directives, this works with `when=`:
+
+   ```python
+   class MyPackage(Package):
+       # 12.0 and higher are proprietary
+       redistribute(source=False, binary=False, when="@12.0:")
+
+       # can't redistribute when we depend on some proprietary dependency
+       redistribute(source=False, binary=False, when="^proprietary-dependency")
+   ```
+
+    More in #20185.
+
+7. **New `conflict:` and `prefer:` syntax for package preferences**
+
+   Previously, you could express conflicts and preferences in `packages.yaml` through
+   some contortions with `require:`:
+
+    ```yaml
+    packages:
+      zlib-ng:
+        require:
+        - one_of: ["%clang", "@:"]   # conflict on %clang
+        - any_of: ["+shared", "@:"]  # strong preference for +shared
+    ```
+
+    You can now use `require:` and `prefer:` for a much more readable configuration:
+
+    ```yaml
+    packages:
+      zlib-ng:
+        conflict:
+        - "%clang"
+        prefer:
+        - "+shared"
+    ```
+
+    See [the documentation](https://spack.readthedocs.io/en/latest/packages_yaml.html#conflicts-and-strong-preferences)
+    and #41832 for more details.
+
+8. **`include_concrete` in environments**
+
+   You may want to build on the *concrete* contents of another environment without
+   changing that environment.  You can now include the concrete specs from another
+   environment's `spack.lock` with `include_concrete`:
+
+   ```yaml
+      spack:
+        specs: []
+        concretizer:
+            unify: true
+        include_concrete:
+        - /path/to/environment1
+        - /path/to/environment2
+   ```
+
+   Now, when *this* environment is concretized, it will bring in the already concrete
+   specs from `environment1` and `environment2`, and build on top of them without
+   changing them. This is useful if you have phased deployments, where old deployments
+   should not be modified but you want to use as many of them as possible. More details
+   in #33768.
+
+9. **`python-venv` isolation**
+
+   Spack has unique requirements for Python because it:
+    1. installs every package in its own independent directory, and
+    2. allows users to register *external* python installations.
+
+   External installations may contain their own installed packages that can interfere
+   with Spack installations, and some distributions (Debian and Ubuntu) even change the
+   `sysconfig` in ways that alter the installation layout of installed Python packages
+   (e.g., with the addition of a `/local` prefix on Debian or Ubuntu). To isolate Spack
+   from these and other issues, we now insert a small `python-venv` package in between
+   `python` and packages that need to install Python code. This isolates Spack's build
+   environment, isolates Spack from any issues with an external python, and resolves a
+   large number of issues we've had with Python installations.
+
+   See #40773 for further details.
+
+## New commands, options, and directives
+
+* Allow packages to be pushed to build cache after install from source (#42423)
+* `spack develop`: stage build artifacts in same root as non-dev builds #41373
+  * Don't delete `spack develop` build artifacts after install (#43424)
+* `spack find`: add options for local/upstream only (#42999)
+* `spack logs`: print log files for packages (either partially built or installed) (#42202)
+* `patch`: support reversing patches (#43040)
+* `develop`: Add -b/--build-directory option to set build_directory package attribute (#39606)
+* `spack list`: add `--namespace` / `--repo` option (#41948)
+* directives: add `checked_by` field to `license()`, add some license checks
+* `spack gc`: add options for environments and build dependencies (#41731)
+* Add `--create` to `spack env activate` (#40896)
+
+## Performance improvements
+
+* environment.py: fix excessive re-reads (#43746)
+* ruamel yaml: fix quadratic complexity bug  (#43745)
+* Refactor to improve `spec format` speed (#43712)
+* Do not acquire a write lock on the env post install if no views (#43505)
+* asp.py: fewer calls to `spec.copy()` (#43715)
+* spec.py: early return in `__str__`
+* avoid `jinja2` import at startup unless needed (#43237)
+
+## Other new features of note
+
+* `archspec`: update to `v0.2.4`: support for Windows, bugfixes for `neoverse-v1` and
+  `neoverse-v2` detection.
+* `spack config get`/`blame`: with no args, show entire config
+* `spack env create <env>`: dir if dir-like (#44024)
+* ASP-based solver: update os compatibility for macOS (#43862)
+* Add handling of custom ssl certs in urllib ops (#42953)
+* Add ability to rename environments (#43296)
+* Add config option and compiler support to reuse across OS's (#42693)
+* Support for prereleases (#43140)
+* Only reuse externals when configured (#41707)
+* Environments: Add support for including views (#42250)
+
+## Binary caches
+* Build cache: make signed/unsigned a mirror property (#41507)
+* tools stack
+
+## Removals, deprecations, and syntax changes
+* remove `dpcpp` compiler and package (#43418)
+* spack load: remove --only argument (#42120)
+
+## Notable Bugfixes
+* repo.py: drop deleted packages from provider cache (#43779)
+* Allow `+` in module file names (#41999)
+* `cmd/python`: use runpy to allow multiprocessing in scripts (#41789)
+* Show extension commands with spack -h (#41726)
+* Support environment variable expansion inside module projections (#42917)
+* Alert user to failed concretizations (#42655)
+* shell: fix zsh color formatting for PS1 in environments (#39497)
+* spack mirror create --all: include patches (#41579)
+
+## Spack community stats
+
+* 7,994 total packages; 525 since `v0.21.0`
+    * 178 new Python packages, 5 new R packages
+* 358 people contributed to this release
+    * 344 committers to packages
+    * 45 committers to core
+
+# v0.21.3 (2024-10-02)
+
+## Bugfixes
+- Forward compatibility with Spack 0.23 packages with language dependencies (#45205, #45191)
+- Forward compatibility with `urllib` from Python 3.12.6+ (#46453, #46483)
+- Bump `archspec` to 0.2.5-dev for better aarch64 and Windows support (#42854, #44005,
+  #45721, #46445)
+- Support macOS Sequoia (#45018, #45127, #43862)
+- CI and test maintenance (#42909, #42728, #46711, #41943, #43363)
+
+# v0.21.2 (2024-03-01)
+
+## Bugfixes
+
+- Containerize: accommodate nested or pre-existing spack-env paths (#41558)
+- Fix setup-env script, when going back and forth between instances (#40924)
+- Fix using fully-qualified namespaces from root specs (#41957)
+- Fix a bug when a required provider is requested for multiple virtuals (#42088)
+- OCI buildcaches:
+  - only push in parallel when forking (#42143)
+  - use pickleable errors (#42160)
+- Fix using sticky variants in externals (#42253)
+- Fix a rare issue with conditional requirements and multi-valued variants (#42566)
+
+## Package updates
+- rust: add v1.75, rework a few variants (#41161,#41903)
+- py-transformers: add v4.35.2 (#41266)
+- mgard: fix OpenMP on AppleClang (#42933)
+
+# v0.21.1 (2024-01-11)
+
+## New features
+- Add support for reading buildcaches created by Spack v0.22 (#41773)
+
+## Bugfixes
+
+- spack graph: fix coloring with environments (#41240)
+- spack info: sort variants in --variants-by-name (#41389)
+- Spec.format: error on old style format strings (#41934)
+- ASP-based solver:
+  - fix infinite recursion when computing concretization errors (#41061)
+  - don't error for type mismatch on preferences (#41138)
+  - don't emit spurious debug output (#41218)
+- Improve the error message for deprecated preferences (#41075)
+- Fix MSVC preview version breaking clingo build on Windows (#41185)
+- Fix multi-word aliases (#41126)
+- Add a warning for unconfigured compiler (#41213)
+- environment: fix an issue with deconcretization/reconcretization of specs (#41294)
+- buildcache: don't error if a patch is missing, when installing from binaries (#41986)
+- Multiple improvements to unit-tests (#41215,#41369,#41495,#41359,#41361,#41345,#41342,#41308,#41226)
+
+## Package updates
+- root: add a webgui patch to address security issue (#41404)
+- BerkeleyGW: update source urls (#38218)
+
 # v0.21.0 (2023-11-11)
 
 `v0.21.0` is a major feature release.
@@ -586,7 +2376,7 @@ Spack now supports Python 3.12 (#40155)
 
    Spack's traditional [package preferences](
      https://spack.readthedocs.io/en/latest/build_settings.html#package-preferences)
-   are soft, but we've added hard requriements to `packages.yaml` and `spack.yaml`
+   are soft, but we've added hard requirements to `packages.yaml` and `spack.yaml`
    (#32528, #32369). Package requirements use the same syntax as specs:
 
    ```yaml
@@ -681,7 +2471,7 @@ Spack now supports Python 3.12 (#40155)
    - `package cflags=-g`:
          `cflags` will NOT be propagated to dependencies
 
-   Syntax for non-boolan variants is similar to compiler flags. More in the docs for
+   Syntax for non-boolean variants is similar to compiler flags. More in the docs for
    [variants](
      https://spack.readthedocs.io/en/latest/basic_usage.html#variants) and [compiler flags](
      https://spack.readthedocs.io/en/latest/basic_usage.html#compiler-flags).
@@ -1304,7 +3094,7 @@ Spack now supports Python 3.12 (#40155)
 * `spack fetch` is now environment-aware. (#19166)
 * Numerous fixes for the new, `clingo`-based concretizer. (#23016, #23307,
   #23090, #22896, #22534, #20644, #20537, #21148)
-* Supoprt for automatically bootstrapping `clingo` from source. (#20652, #20657
+* Support for automatically bootstrapping `clingo` from source. (#20652, #20657
   #21364, #21446, #21913, #22354, #22444, #22460, #22489, #22610, #22631)
 * Python 3.10 support: `collections.abc` (#20441)
 * Fix import issues by using `__import__` instead of Spack package importe.

@@ -1,10 +1,10 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 import pytest
 
+import spack.concretize
 import spack.deptypes as dt
 import spack.installer as inst
 import spack.repo
@@ -22,8 +22,7 @@ def test_build_request_errors(install_mockery):
 
 
 def test_build_request_basics(install_mockery):
-    spec = spack.spec.Spec("dependent-install")
-    spec.concretize()
+    spec = spack.concretize.concretize_one("dependent-install")
     assert spec.concrete
 
     # Ensure key properties match expectations
@@ -40,8 +39,7 @@ def test_build_request_basics(install_mockery):
 def test_build_request_strings(install_mockery):
     """Tests of BuildRequest repr and str for coverage purposes."""
     # Using a package with one dependency
-    spec = spack.spec.Spec("dependent-install")
-    spec.concretize()
+    spec = spack.concretize.concretize_one("dependent-install")
     assert spec.concrete
 
     # Ensure key properties match expectations
@@ -58,29 +56,21 @@ def test_build_request_strings(install_mockery):
 
 
 @pytest.mark.parametrize(
-    "package_cache_only,dependencies_cache_only,package_deptypes,dependencies_deptypes",
+    "root_policy,dependencies_policy,package_deptypes,dependencies_deptypes",
     [
-        (False, False, dt.BUILD | dt.LINK | dt.RUN, dt.BUILD | dt.LINK | dt.RUN),
-        (True, False, dt.LINK | dt.RUN, dt.BUILD | dt.LINK | dt.RUN),
-        (False, True, dt.BUILD | dt.LINK | dt.RUN, dt.LINK | dt.RUN),
-        (True, True, dt.LINK | dt.RUN, dt.LINK | dt.RUN),
+        ("auto", "auto", dt.BUILD | dt.LINK | dt.RUN, dt.BUILD | dt.LINK | dt.RUN),
+        ("cache_only", "auto", dt.LINK | dt.RUN, dt.BUILD | dt.LINK | dt.RUN),
+        ("auto", "cache_only", dt.BUILD | dt.LINK | dt.RUN, dt.LINK | dt.RUN),
+        ("cache_only", "cache_only", dt.LINK | dt.RUN, dt.LINK | dt.RUN),
     ],
 )
 def test_build_request_deptypes(
-    install_mockery,
-    package_cache_only,
-    dependencies_cache_only,
-    package_deptypes,
-    dependencies_deptypes,
+    install_mockery, root_policy, dependencies_policy, package_deptypes, dependencies_deptypes
 ):
-    s = spack.spec.Spec("dependent-install").concretized()
+    s = spack.concretize.concretize_one("dependent-install")
 
     build_request = inst.BuildRequest(
-        s.package,
-        {
-            "package_cache_only": package_cache_only,
-            "dependencies_cache_only": dependencies_cache_only,
-        },
+        s.package, {"root_policy": root_policy, "dependencies_policy": dependencies_policy}
     )
 
     actual_package_deptypes = build_request.get_depflags(s.package)

@@ -1,18 +1,22 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 import os
+import pathlib
 
 import pytest
 
-import archspec.cpu
+import spack.vendor.archspec.cpu
 
+import spack.concretize
+import spack.config
 import spack.environment as ev
 import spack.main
+import spack.modules.common
 import spack.modules.lmod
 import spack.spec
+import spack.util.environment
 
 mpich_spec_string = "mpich@3.0.4"
 mpileaks_spec_string = "mpileaks"
@@ -29,26 +33,28 @@ pytestmark = [
 ]
 
 
-@pytest.fixture(params=["clang@=12.0.0", "gcc@=10.2.1"])
+@pytest.fixture(params=["clang@=15.0.0", "gcc@=10.2.1"])
 def compiler(request):
     return request.param
 
 
 @pytest.fixture(
     params=[
-        ("mpich@3.0.4", ("mpi",)),
-        ("mpich@3.0.1", []),
-        ("openblas@0.2.15", ("blas",)),
-        ("openblas-with-lapack@0.2.15", ("blas", "lapack")),
-        ("mpileaks@2.3", ("mpi",)),
-        ("mpileaks@2.1", []),
+        ("mpich@3.0.4", ("mpi",), True, False),
+        ("mpich@3.0.1", [], True, True),
+        ("openblas@0.2.15", ("blas",), True, False),
+        ("openblas-with-lapack@0.2.15", ("blas", "lapack"), True, False),
+        ("mpileaks@2.3", ("mpi",), True, False),
+        ("mpileaks@2.1", [], True, False),
+        ("py-extension1@2.0", ("python",), False, True),
+        ("python@3.8.0", ("python",), False, True),
     ]
 )
 def provider(request):
     return request.param
 
 
-@pytest.mark.usefixtures("config", "mock_packages")
+@pytest.mark.usefixtures("mutable_config", "mock_packages")
 class TestLmod:
     @pytest.mark.regression("37788")
     @pytest.mark.parametrize("modules_config", ["core_compilers", "core_compilers_at_equal"])
@@ -59,14 +65,20 @@ class TestLmod:
         we can use both ``compiler@version`` and ``compiler@=version`` to specify a core compiler.
         """
         module_configuration(modules_config)
-        module, spec = factory("libelf%clang@12.0.0")
+        module, spec = factory("libelf%clang@15.0.0")
         assert "Core" in module.layout.available_path_parts
 
     def test_file_layout(self, compiler, provider, factory, module_configuration):
         """Tests the layout of files in the hierarchy is the one expected."""
         module_configuration("complex_hierarchy")
-        spec_string, services = provider
-        module, spec = factory(spec_string + "%" + compiler)
+        spec_string, services, use_compiler, place_in_core = provider
+
+        # Non-python specs add compiler
+        factory_string = spec_string
+        if use_compiler:
+            factory_string += "%" + compiler
+
+        module, spec = factory(factory_string)
 
         layout = module.layout
 
@@ -78,7 +90,8 @@ class TestLmod:
         # is transformed to r"Core" if the compiler is listed among core
         # compilers
         # Check that specs listed as core_specs are transformed to "Core"
-        if compiler == "clang@=12.0.0" or spec_string == "mpich@3.0.1":
+        # Check that specs with no hierarchy components are transformed to "Core"
+        if "clang@=15.0.0" in factory_string or place_in_core:
             assert "Core" in layout.available_path_parts
         else:
             assert compiler.replace("@=", "/") in layout.available_path_parts
@@ -89,9 +102,12 @@ class TestLmod:
         service_part = spec_string.replace("@", "/")
         service_part = "-".join([service_part, layout.spec.dag_hash(length=7)])
 
-        if "mpileaks" in spec_string:
+        if "mpi" in spec:
             # It's a user, not a provider, so create the provider string
             service_part = layout.spec["mpi"].format("{name}/{version}-{hash:7}")
+        elif "python" in spec:
+            # It's a user, not a provider, so create the provider string
+            service_part = layout.spec["python"].format("{name}/{version}-{hash:7}")
         else:
             # Only relevant for providers, not users, of virtuals
             assert service_part in path_parts
@@ -109,7 +125,7 @@ class TestLmod:
         self, factory, module_configuration, compiler_factory
     ):
         with spack.config.override(
-            "compilers", [compiler_factory(spec="clang@3.3", operating_system="debian6")]
+            "packages", {"llvm": {"externals": [compiler_factory(spec="llvm@3.3 +clang")]}}
         ):
             module_configuration("complex_hierarchy")
             module, spec = factory("intel-oneapi-compilers%clang@3.3")
@@ -117,7 +133,17 @@ class TestLmod:
             provides = module.conf.provides
 
             assert "compiler" in provides
-            assert provides["compiler"] == spack.spec.CompilerSpec("oneapi@=3.0")
+            assert provides["compiler"] == spack.spec.Spec("intel-oneapi-compilers@=3.0")
+
+    @pytest.mark.parametrize("language", ["c", "cxx", "fortran"])
+    def test_compiler_language_virtuals(self, factory, module_configuration, language):
+        """Tests all compiler virtuals for hierarchical module placement."""
+        module_configuration("complex_hierarchy")
+        module, spec = factory(f"single-language-virtual +{language} %{language}=gcc@=10.2.1")
+
+        requires = module.conf.requires
+
+        assert "gcc@=10.2.1" in requires["compiler"]
 
     def test_simple_case(self, modulefile_content, module_configuration):
         """Tests the generation of a simple Lua module file."""
@@ -136,7 +162,7 @@ class TestLmod:
         module_configuration("autoload_direct")
         content = modulefile_content(mpileaks_spec_string)
 
-        assert len([x for x in content if "depends_on(" in x]) == 2
+        assert len([x for x in content if "depends_on(" in x]) == 3
 
     def test_autoload_all(self, modulefile_content, module_configuration):
         """Tests the automatic loading of all dependencies."""
@@ -144,11 +170,8 @@ class TestLmod:
         module_configuration("autoload_all")
         content = modulefile_content(mpileaks_spec_string)
 
-        assert len([x for x in content if "depends_on(" in x]) == 5
+        assert len([x for x in content if "depends_on(" in x]) == 6
 
-    @pytest.mark.skipif(
-        str(archspec.cpu.host().family) != "x86_64", reason="test data is specific for x86_64"
-    )
     def test_alter_environment(self, modulefile_content, module_configuration):
         """Tests modifications to run-time environment."""
 
@@ -221,7 +244,8 @@ class TestLmod:
         assert len([x for x in content if 'setenv("FOO", "{{name}}, {name}, {{}}, {}")' in x]) == 1
 
     @pytest.mark.skipif(
-        str(archspec.cpu.host().family) != "x86_64", reason="test data is specific for x86_64"
+        str(spack.vendor.archspec.cpu.host().family) != "x86_64",
+        reason="test data is specific for x86_64",
     )
     def test_help_message(self, modulefile_content, module_configuration):
         """Tests the generation of module help message."""
@@ -265,7 +289,7 @@ class TestLmod:
         module_configuration("exclude")
         content = modulefile_content(mpileaks_spec_string)
 
-        assert len([x for x in content if "depends_on(" in x]) == 1
+        assert len([x for x in content if "depends_on(" in x]) == 2
 
     def test_no_hash(self, factory, module_configuration):
         """Makes sure that virtual providers (in the hierarchy) always
@@ -308,16 +332,6 @@ class TestLmod:
         with pytest.raises(spack.modules.lmod.CoreCompilersNotFoundError):
             module.write()
 
-    def test_non_virtual_in_hierarchy(self, factory, module_configuration):
-        """Ensures that if a non-virtual is in hierarchy, an exception will
-        be raised.
-        """
-        module_configuration("non_virtual_in_hierarchy")
-
-        module, spec = factory(mpileaks_spec_string)
-        with pytest.raises(spack.modules.lmod.NonVirtualInHierarchyError):
-            module.write()
-
     def test_conflicts(self, modulefile_content, module_configuration):
         """Tests adding conflicts to the module."""
 
@@ -358,7 +372,6 @@ class TestLmod:
         content = modulefile_content(f"mpileaks target={host_architecture_str}")
         assert "Override even better!" in content
 
-    @pytest.mark.usefixtures("config")
     def test_external_configure_args(self, factory):
         # If this package is detected as an external, its configure option line
         # in the module file starts with 'unknown'
@@ -373,7 +386,7 @@ class TestLmod:
         module_configuration("missing_core_compilers")
 
         # Our mock paths must be detected as system paths
-        monkeypatch.setattr(spack.util.environment, "SYSTEM_DIRS", ["/path/to"])
+        monkeypatch.setattr(spack.util.environment, "SYSTEM_DIRS", ["/path/bin"])
 
         # We don't want to really write into user configuration
         # when running tests
@@ -431,13 +444,18 @@ class TestLmod:
         assert projection in writer.layout.use_name
 
     def test_modules_relative_to_view(
-        self, tmpdir, modulefile_content, module_configuration, install_mockery, mock_fetch
+        self,
+        tmp_path: pathlib.Path,
+        modulefile_content,
+        module_configuration,
+        install_mockery,
+        mock_fetch,
     ):
-        with ev.create_in_dir(str(tmpdir), with_view=True) as e:
+        with ev.create_in_dir(str(tmp_path), with_view=True) as e:
             module_configuration("with_view")
-            install("--add", "cmake")
+            install("--fake", "--add", "cmake")
 
-            spec = spack.spec.Spec("cmake").concretized()
+            spec = spack.concretize.concretize_one("cmake")
 
             content = modulefile_content("cmake")
             expected = e.default_view.get_projection_for_spec(spec)
@@ -457,13 +475,13 @@ class TestLmod:
         """Tests the addition and removal of hide command in modulerc."""
         module_configuration("hide_implicits")
 
-        spec = spack.spec.Spec("mpileaks@2.3").concretized()
+        spec = spack.concretize.concretize_one("mpileaks@2.3")
 
         # mpileaks is defined as implicit, thus hide command should appear in modulerc
         writer = writer_cls(spec, "default", False)
         writer.write()
         assert os.path.exists(writer.layout.modulerc)
-        with open(writer.layout.modulerc) as f:
+        with open(writer.layout.modulerc, encoding="utf-8") as f:
             content = [line.strip() for line in f.readlines()]
         hide_implicit_mpileaks = f'hide_version("{writer.layout.use_name}")'
         assert len([x for x in content if hide_implicit_mpileaks == x]) == 1
@@ -472,7 +490,7 @@ class TestLmod:
         # except for mpich, which is provider for mpi, which is in the hierarchy, and therefore
         # can't be hidden. All other hidden modules should have a 7 character hash (the config
         # hash_length = 0 only applies to exposed modules).
-        with open(writer.layout.filename) as f:
+        with open(writer.layout.filename, encoding="utf-8") as f:
             depends_statements = [line.strip() for line in f.readlines() if "depends_on" in line]
             for dep in spec.dependencies(deptype=("link", "run")):
                 if dep.satisfies("mpi"):
@@ -485,7 +503,7 @@ class TestLmod:
         writer = writer_cls(spec, "default", True)
         writer.write()
         assert os.path.exists(writer.layout.modulerc)
-        with open(writer.layout.modulerc) as f:
+        with open(writer.layout.modulerc, encoding="utf-8") as f:
             content = [line.strip() for line in f.readlines()]
         assert hide_implicit_mpileaks in content  # old, implicit mpileaks is still hidden
         assert f'hide_version("{writer.layout.use_name}")' not in content
@@ -509,14 +527,14 @@ class TestLmod:
         # three versions of mpileaks are implicit
         writer = writer_cls(spec, "default", False)
         writer.write(overwrite=True)
-        spec_alt1 = spack.spec.Spec("mpileaks@2.2").concretized()
-        spec_alt2 = spack.spec.Spec("mpileaks@2.1").concretized()
+        spec_alt1 = spack.concretize.concretize_one("mpileaks@2.2")
+        spec_alt2 = spack.concretize.concretize_one("mpileaks@2.1")
         writer_alt1 = writer_cls(spec_alt1, "default", False)
         writer_alt1.write(overwrite=True)
         writer_alt2 = writer_cls(spec_alt2, "default", False)
         writer_alt2.write(overwrite=True)
         assert os.path.exists(writer.layout.modulerc)
-        with open(writer.layout.modulerc) as f:
+        with open(writer.layout.modulerc, encoding="utf-8") as f:
             content = [line.strip() for line in f.readlines()]
         hide_cmd = f'hide_version("{writer.layout.use_name}")'
         hide_cmd_alt1 = f'hide_version("{writer_alt1.layout.use_name}")'
@@ -528,7 +546,7 @@ class TestLmod:
         # one version is removed
         writer_alt1.remove()
         assert os.path.exists(writer.layout.modulerc)
-        with open(writer.layout.modulerc) as f:
+        with open(writer.layout.modulerc, encoding="utf-8") as f:
             content = [line.strip() for line in f.readlines()]
         assert len([x for x in content if hide_cmd == x]) == 1
         assert len([x for x in content if hide_cmd_alt1 == x]) == 0

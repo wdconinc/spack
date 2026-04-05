@@ -1,5 +1,4 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
@@ -8,21 +7,23 @@ import collections
 import errno
 import getpass
 import os
+import pathlib
 import shutil
 import stat
 import sys
 
 import pytest
 
-from llnl.util.filesystem import getuid, mkdirp, partition_path, touch, working_dir
-
+import spack.config
 import spack.error
-import spack.paths
+import spack.fetch_strategy
 import spack.stage
 import spack.util.executable
+import spack.util.path
 import spack.util.url as url_util
+from spack.llnl.util.filesystem import getuid, mkdirp, partition_path, readlink, touch, working_dir
 from spack.resource import Resource
-from spack.stage import DevelopStage, DIYStage, ResourceStage, Stage, StageComposite
+from spack.stage import DevelopStage, ResourceStage, Stage, StageComposite
 from spack.util.path import canonicalize_path
 
 # The following values are used for common fetch and stage mocking fixtures:
@@ -123,8 +124,8 @@ def check_expand_archive(stage, stage_name, expected_file_list):
             assert False
 
         assert os.path.isfile(fn)
-        with open(fn) as _file:
-            _file.read() == contents
+        with open(fn, encoding="utf-8") as _file:
+            assert _file.read() == contents
 
 
 def check_fetch(stage, stage_name):
@@ -145,9 +146,8 @@ def check_destroy(stage, stage_name):
     assert not os.path.exists(stage_path)
 
     # tmp stage needs to remove tmp dir too.
-    if not isinstance(stage, DIYStage):
-        target = os.path.realpath(stage_path)
-        assert not os.path.exists(target)
+    target = os.path.realpath(stage_path)
+    assert not os.path.exists(target)
 
 
 def check_setup(stage, stage_name, archive):
@@ -186,11 +186,11 @@ def get_stage_path(stage, stage_name):
 #       the `mock_stage` path in `mock_stage_archive`) per discussions in
 #       #12857.  See also #13065.
 @pytest.fixture
-def tmp_build_stage_dir(tmpdir, clear_stage_root):
+def tmp_build_stage_dir(tmp_path: pathlib.Path, clear_stage_root):
     """Use a temporary test directory for the stage root."""
-    test_path = str(tmpdir.join("stage"))
+    test_path = str(tmp_path / "stage")
     with spack.config.override("config:build_stage", test_path):
-        yield tmpdir, spack.stage.get_stage_root()
+        yield tmp_path, spack.stage.get_stage_root()
 
     shutil.rmtree(test_path)
 
@@ -201,7 +201,7 @@ def mock_stage_archive(tmp_build_stage_dir):
 
     # Mock up a stage area that looks like this:
     #
-    # tmpdir/                test_files_dir
+    # tmp_path/              test_files_dir
     #     stage/             test_stage_path (where stage should be)
     #     <_archive_base>/   archive_dir_path
     #         <_readme_fn>   Optional test_readme (contains _readme_contents)
@@ -210,14 +210,14 @@ def mock_stage_archive(tmp_build_stage_dir):
     #     <_archive_fn>      archive_url = file:///path/to/<_archive_fn>
     #
     def create_stage_archive(expected_file_list=[_include_readme]):
-        tmpdir, test_stage_path = tmp_build_stage_dir
+        tmp_build_dir, test_stage_path = tmp_build_stage_dir
         mkdirp(test_stage_path)
 
         # Create the archive directory and associated file
-        archive_dir = tmpdir.join(_archive_base)
-        archive = tmpdir.join(_archive_fn)
+        archive_dir = tmp_build_dir / _archive_base
+        archive = tmp_build_dir / _archive_fn
         archive_url = url_util.path_to_file_url(str(archive))
-        archive_dir.ensure(dir=True)
+        archive_dir.mkdir(exist_ok=True)
 
         # Create the optional files as requested and make sure expanded
         # archive peers are included.
@@ -228,66 +228,69 @@ def mock_stage_archive(tmp_build_stage_dir):
                 # represent HFS metadata.  Locate in the same directory as the
                 # archive file.
                 tar_args.append(_hidden_fn)
-                fn, contents = (tmpdir.join(_hidden_fn), _hidden_contents)
+                fn, contents = (tmp_build_dir / _hidden_fn, _hidden_contents)
 
             elif _include == _include_readme:
                 # The usual README.txt file is contained in the archive dir.
-                fn, contents = (archive_dir.join(_readme_fn), _readme_contents)
+                fn, contents = (archive_dir / _readme_fn, _readme_contents)
 
             elif _include == _include_extra:
                 # The extra file stands in for exploding tar files so needs
                 # to be in the same directory as the archive file.
                 tar_args.append(_extra_fn)
-                fn, contents = (tmpdir.join(_extra_fn), _extra_contents)
+                fn, contents = (tmp_build_dir / _extra_fn, _extra_contents)
             else:
                 break
 
-            fn.write(contents)
+            fn.write_text(contents)
 
         # Create the archive file
-        with tmpdir.as_cwd():
+        with working_dir(str(tmp_build_dir)):
             tar = spack.util.executable.which("tar", required=True)
             tar(*tar_args)
 
         Archive = collections.namedtuple("Archive", ["url", "tmpdir", "stage_path", "archive_dir"])
         return Archive(
-            url=archive_url, tmpdir=tmpdir, stage_path=test_stage_path, archive_dir=archive_dir
+            url=archive_url,
+            tmpdir=tmp_build_dir,
+            stage_path=test_stage_path,
+            archive_dir=archive_dir,
         )
 
     return create_stage_archive
 
 
 @pytest.fixture
-def mock_noexpand_resource(tmpdir):
-    """Set up a non-expandable resource in the tmpdir prior to staging."""
-    test_resource = tmpdir.join("resource-no-expand.sh")
-    test_resource.write("an example resource")
+def mock_noexpand_resource(tmp_path: pathlib.Path):
+    """Set up a non-expandable resource in the tmp_path prior to staging."""
+    test_resource = tmp_path / "resource-no-expand.sh"
+    test_resource.write_text("an example resource")
     return str(test_resource)
 
 
 @pytest.fixture
-def mock_expand_resource(tmpdir):
-    """Sets up an expandable resource in tmpdir prior to staging."""
+def mock_expand_resource(tmp_path: pathlib.Path):
+    """Sets up an expandable resource in tmp_path prior to staging."""
     # Mock up an expandable resource:
     #
-    # tmpdir/                    test_files_dir
+    # tmp_path/                  test_files_dir
     #     resource-expand/       resource source dir
     #         resource-file.txt  resource contents (contains 'test content')
     #     resource.tar.gz        archive of resource content
     #
     subdir = "resource-expand"
-    resource_dir = tmpdir.join(subdir)
-    resource_dir.ensure(dir=True)
+    resource_dir = tmp_path / subdir
+    resource_dir.mkdir()
 
     archive_name = "resource.tar.gz"
-    archive = tmpdir.join(archive_name)
+    archive = tmp_path / archive_name
     archive_url = url_util.path_to_file_url(str(archive))
 
     filename = "resource-file.txt"
-    test_file = resource_dir.join(filename)
-    test_file.write("test content\n")
+    test_file = resource_dir / filename
+    test_file.write_text("test content\n")
 
-    with tmpdir.as_cwd():
+    with working_dir(str(tmp_path)):
         tar = spack.util.executable.which("tar", required=True)
         tar("czf", str(archive_name), subdir)
 
@@ -323,17 +326,11 @@ def failing_search_fn():
     return _mock
 
 
-@pytest.fixture
-def failing_fetch_strategy():
-    """Returns a fetch strategy that fails."""
-
-    class FailingFetchStrategy(spack.fetch_strategy.FetchStrategy):
-        def fetch(self):
-            raise spack.fetch_strategy.FailedDownloadError(
-                "<non-existent URL>", "This implementation of FetchStrategy always fails"
-            )
-
-    return FailingFetchStrategy()
+class FailingFetchStrategy(spack.fetch_strategy.FetchStrategy):
+    def fetch(self):
+        raise spack.fetch_strategy.FailedDownloadError(
+            "<non-existent URL>", "This implementation of FetchStrategy always fails"
+        )
 
 
 @pytest.fixture
@@ -511,8 +508,8 @@ class TestStage:
             stage.fetch()
         check_destroy(stage, self.stage_name)
 
-    def test_no_search_mirror_only(self, failing_fetch_strategy, failing_search_fn):
-        stage = Stage(failing_fetch_strategy, name=self.stage_name, search_fn=failing_search_fn)
+    def test_no_search_mirror_only(self, failing_search_fn):
+        stage = Stage(FailingFetchStrategy(), name=self.stage_name, search_fn=failing_search_fn)
         with stage:
             try:
                 stage.fetch(mirror_only=True)
@@ -527,8 +524,8 @@ class TestStage:
             (None, "All fetchers failed"),
         ],
     )
-    def test_search_if_default_fails(self, failing_fetch_strategy, search_fn, err_msg, expected):
-        stage = Stage(failing_fetch_strategy, name=self.stage_name, search_fn=search_fn)
+    def test_search_if_default_fails(self, search_fn, err_msg, expected):
+        stage = Stage(FailingFetchStrategy(), name=self.stage_name, search_fn=search_fn)
 
         with stage:
             with pytest.raises(spack.error.FetchError, match=expected):
@@ -586,7 +583,7 @@ class TestStage:
                 check_expand_archive(stage, self.stage_name, [_include_readme])
 
                 # Try to make a file in the old archive dir
-                with open("foobar", "w") as file:
+                with open("foobar", "w", encoding="utf-8") as file:
                     file.write("this file is to be destroyed.")
 
             assert "foobar" in os.listdir(stage.source_path)
@@ -655,20 +652,21 @@ class TestStage:
 
     @pytest.mark.not_on_windows("Windows file permission erroring is not yet supported")
     @pytest.mark.skipif(getuid() == 0, reason="user is root")
-    def test_first_accessible_path(self, tmpdir):
+    def test_first_accessible_path(self, tmp_path: pathlib.Path):
         """Test _first_accessible_path names."""
-        spack_dir = tmpdir.join("paths")
+        spack_dir = tmp_path / "paths"
         name = str(spack_dir)
         files = [os.path.join(os.path.sep, "no", "such", "path"), name]
 
-        # Ensure the tmpdir path is returned since the user should have access
+        # Ensure the tmp_path path is returned since the user should have access
         path = spack.stage._first_accessible_path(files)
         assert path == name
         assert os.path.isdir(path)
-        check_stage_dir_perms(str(tmpdir), path)
+        check_stage_dir_perms(str(tmp_path), path)
 
         # Ensure an existing path is returned
-        spack_subdir = spack_dir.join("existing").ensure(dir=True)
+        spack_subdir = spack_dir / "existing"
+        spack_subdir.mkdir(parents=True)
         subdir = str(spack_subdir)
         path = spack.stage._first_accessible_path([subdir])
         assert path == subdir
@@ -676,23 +674,23 @@ class TestStage:
         # Ensure a path with a `$user` node has the right permissions
         # for its subdirectories.
         user = getpass.getuser()
-        user_dir = spack_dir.join(user, "has", "paths")
+        user_dir = spack_dir / user / "has" / "paths"
         user_path = str(user_dir)
         path = spack.stage._first_accessible_path([user_path])
         assert path == user_path
-        check_stage_dir_perms(str(tmpdir), path)
+        check_stage_dir_perms(str(tmp_path), path)
 
         # Cleanup
         shutil.rmtree(str(name))
 
-    def test_create_stage_root(self, tmpdir, no_path_access):
+    def test_create_stage_root(self, tmp_path: pathlib.Path, no_path_access):
         """Test create_stage_root permissions."""
-        test_dir = tmpdir.join("path")
+        test_dir = tmp_path / "path"
         test_path = str(test_dir)
 
         try:
             if getpass.getuser() in str(test_path).split(os.sep):
-                # Simply ensure directory created if tmpdir includes user
+                # Simply ensure directory created if tmp_path includes user
                 spack.stage.create_stage_root(test_path)
                 assert os.path.exists(test_path)
 
@@ -710,39 +708,45 @@ class TestStage:
             except OSError:
                 pass
 
-    def test_resolve_paths(self):
+    def test_resolve_paths(self, monkeypatch):
         """Test _resolve_paths."""
         assert spack.stage._resolve_paths([]) == []
 
-        # resolved path without user appends user
-        paths = [os.path.join(os.path.sep, "a", "b", "c")]
-        can_paths = [paths[0]]
-        user = getpass.getuser()
+        user = "testuser"
+        monkeypatch.setattr(spack.util.path, "get_user", lambda: user)
 
-        if sys.platform != "win32":
-            can_paths = [os.path.join(paths[0], user)]
-        assert spack.stage._resolve_paths(paths) == can_paths
+        # Test that user is appended to path if not present (except on Windows)
+        if sys.platform == "win32":
+            path = r"C:\spack-test\a\b\c"
+            expected = path
+        else:
+            path = "/spack-test/a/b/c"
+            expected = os.path.join(path, user)
 
-        # resolved path with node including user does not append user
-        paths = [os.path.join(os.path.sep, "spack-{0}".format(user), "stage")]
-        assert spack.stage._resolve_paths(paths) == paths
+        assert spack.stage._resolve_paths([path]) == [expected]
 
-        tempdir = "$tempdir"
-        can_tempdir = canonicalize_path(tempdir)
-        user = getpass.getuser()
-        temp_has_user = user in can_tempdir.split(os.sep)
+        # Test that user is NOT appended if already present
+        if sys.platform == "win32":
+            path_with_user = rf"C:\spack-test\spack-{user}\stage"
+        else:
+            path_with_user = f"/spack-test/spack-{user}/stage"
+
+        assert spack.stage._resolve_paths([path_with_user]) == [path_with_user]
+
+        canonicalized_tempdir = canonicalize_path("$tempdir")
+        temp_has_user = user in canonicalized_tempdir.split(os.sep)
         paths = [
-            os.path.join(tempdir, "stage"),
-            os.path.join(tempdir, "$user"),
-            os.path.join(tempdir, "$user", "$user"),
-            os.path.join(tempdir, "$user", "stage", "$user"),
+            os.path.join("$tempdir", "stage"),
+            os.path.join("$tempdir", "$user"),
+            os.path.join("$tempdir", "$user", "$user"),
+            os.path.join("$tempdir", "$user", "stage", "$user"),
         ]
 
         res_paths = [canonicalize_path(p) for p in paths]
         if temp_has_user:
-            res_paths[1] = can_tempdir
-            res_paths[2] = os.path.join(can_tempdir, user)
-            res_paths[3] = os.path.join(can_tempdir, "stage", user)
+            res_paths[1] = canonicalized_tempdir
+            res_paths[2] = os.path.join(canonicalized_tempdir, user)
+            res_paths[3] = os.path.join(canonicalized_tempdir, "stage", user)
         elif sys.platform != "win32":
             res_paths[0] = os.path.join(res_paths[0], user)
 
@@ -767,18 +771,16 @@ class TestStage:
             ("stage-spack", False),
         ],
     )
-    def test_stage_purge(self, tmpdir, clear_stage_root, path, purged):
+    def test_stage_purge(self, tmp_path: pathlib.Path, clear_stage_root, path, purged):
         """Test purging of stage directories."""
-        stage_dir = tmpdir.join("stage")
-        stage_path = str(stage_dir)
+        stage_config_path = str(tmp_path / "stage")
 
-        test_dir = stage_dir.join(path)
-        test_dir.ensure(dir=True)
-        test_path = str(test_dir)
-
-        with spack.config.override("config:build_stage", stage_path):
+        with spack.config.override("config:build_stage", stage_config_path):
             stage_root = spack.stage.get_stage_root()
-            assert stage_path == stage_root
+
+            test_dir = pathlib.Path(stage_root) / path
+            test_dir.mkdir(parents=True)
+            test_path = str(test_dir)
 
             spack.stage.purge()
 
@@ -794,67 +796,11 @@ class TestStage:
             with Stage(None):
                 pass
 
-    def test_stage_constructor_with_path(self, tmpdir):
+    def test_stage_constructor_with_path(self, tmp_path: pathlib.Path):
         """Ensure Stage constructor with a path uses it."""
-        testpath = str(tmpdir)
+        testpath = str(tmp_path)
         with Stage("file:///does-not-exist", path=testpath) as stage:
             assert stage.path == testpath
-
-    def test_diystage_path_none(self):
-        """Ensure DIYStage for path=None behaves as expected."""
-        with pytest.raises(ValueError):
-            DIYStage(None)
-
-    def test_diystage_path_invalid(self):
-        """Ensure DIYStage for an invalid path behaves as expected."""
-        with pytest.raises(spack.stage.StagePathError):
-            DIYStage("/path/does/not/exist")
-
-    def test_diystage_path_valid(self, tmpdir):
-        """Ensure DIYStage for a valid path behaves as expected."""
-        path = str(tmpdir)
-        stage = DIYStage(path)
-        assert stage.path == path
-        assert stage.source_path == path
-
-        # Order doesn't really matter for DIYStage since they are
-        # basically NOOPs; however, call each since they are part
-        # of the normal stage usage and to ensure full test coverage.
-        stage.create()  # Only sets the flag value
-        assert stage.created
-
-        stage.cache_local()  # Only outputs a message
-        stage.fetch()  # Only outputs a message
-        stage.check()  # Only outputs a message
-        stage.expand_archive()  # Only outputs a message
-
-        assert stage.expanded  # The path/source_path does exist
-
-        with pytest.raises(spack.stage.RestageError):
-            stage.restage()
-
-        stage.destroy()  # A no-op
-        assert stage.path == path  # Ensure can still access attributes
-        assert os.path.exists(stage.source_path)  # Ensure path still exists
-
-    def test_diystage_preserve_file(self, tmpdir):
-        """Ensure DIYStage preserves an existing file."""
-        # Write a file to the temporary directory
-        fn = tmpdir.join(_readme_fn)
-        fn.write(_readme_contents)
-
-        # Instantiate the DIYStage and ensure the above file is unchanged.
-        path = str(tmpdir)
-        stage = DIYStage(path)
-        assert os.path.isdir(path)
-        assert os.path.isfile(str(fn))
-
-        stage.create()  # Only sets the flag value
-
-        readmefn = str(fn)
-        assert os.path.isfile(readmefn)
-        with open(readmefn) as _file:
-            _file.read() == _readme_contents
 
 
 def _create_files_from_tree(base, tree):
@@ -865,14 +811,14 @@ def _create_files_from_tree(base, tree):
             _create_files_from_tree(sub_base, content)
         else:
             assert (content is None) or (isinstance(content, str))
-            with open(sub_base, "w") as f:
+            with open(sub_base, "w", encoding="utf-8") as f:
                 if content:
                     f.write(content)
 
 
 def _create_tree_from_dir_recursive(path):
     if os.path.islink(path):
-        return os.readlink(path)
+        return readlink(path)
     elif os.path.isdir(path):
         tree = {}
         for name in os.listdir(path):
@@ -880,15 +826,15 @@ def _create_tree_from_dir_recursive(path):
             tree[name] = _create_tree_from_dir_recursive(sub_path)
         return tree
     else:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             content = f.read() or None
         return content
 
 
 @pytest.fixture
-def develop_path(tmpdir):
+def develop_path(tmp_path: pathlib.Path):
     dir_structure = {"a1": {"b1": None, "b2": "b1content"}, "a2": None}
-    srcdir = str(tmpdir.join("test-src"))
+    srcdir = str(tmp_path / "test-src")
     os.mkdir(srcdir)
     _create_files_from_tree(srcdir, dir_structure)
     yield dir_structure, srcdir
@@ -897,7 +843,7 @@ def develop_path(tmpdir):
 class TestDevelopStage:
     def test_sanity_check_develop_path(self, develop_path):
         _, srcdir = develop_path
-        with open(os.path.join(srcdir, "a1", "b2")) as f:
+        with open(os.path.join(srcdir, "a1", "b2"), encoding="utf-8") as f:
             assert f.read() == "b1content"
 
         assert os.path.exists(os.path.join(srcdir, "a2"))
@@ -909,18 +855,20 @@ class TestDevelopStage:
         """
         devtree, srcdir = develop_path
         stage = DevelopStage("test-stage", srcdir, reference_link="link-to-stage")
+        assert not os.path.exists(stage.reference_link)
         stage.create()
+        assert os.path.exists(stage.reference_link)
         srctree1 = _create_tree_from_dir_recursive(stage.source_path)
         assert os.path.samefile(srctree1["link-to-stage"], stage.path)
         del srctree1["link-to-stage"]
         assert srctree1 == devtree
 
         stage.destroy()
+        assert not os.path.exists(stage.reference_link)
         # Make sure destroying the stage doesn't change anything
         # about the path
         assert not os.path.exists(stage.path)
         srctree2 = _create_tree_from_dir_recursive(srcdir)
-        del srctree2["link-to-stage"]  # Note the symlink persists but is broken
         assert srctree2 == devtree
 
 
@@ -940,13 +888,13 @@ def test_stage_create_replace_path(tmp_build_stage_dir):
     assert os.path.isdir(nondir)
 
 
-def test_cannot_access(capsys):
+def test_cannot_access(capfd):
     """Ensure can_access dies with the expected error."""
     with pytest.raises(SystemExit):
         # It's far more portable to use a non-existent filename.
         spack.stage.ensure_access("/no/such/file")
 
-    captured = capsys.readouterr()
+    captured = capfd.readouterr()
     assert "Insufficient permissions" in str(captured)
 
 

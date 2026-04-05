@@ -1,24 +1,23 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
-import llnl.util.tty as tty
+import argparse
 
 import spack.cmd
 import spack.config
 import spack.environment as ev
+import spack.llnl.util.tty as tty
 import spack.package_base
-import spack.repo
 import spack.traverse
 from spack.cmd.common import arguments
 
-description = "patch expanded archive sources in preparation for install"
+description = "patch expanded sources in preparation for install"
 section = "build"
 level = "long"
 
 
-def setup_parser(subparser):
+def setup_parser(subparser: argparse.ArgumentParser) -> None:
     arguments.add_common_arguments(subparser, ["no_checksum", "specs"])
     arguments.add_concretizer_args(subparser)
 
@@ -34,8 +33,9 @@ def patch(parser, args):
         spack.config.set("config:checksum", False, scope="command_line")
 
     specs = spack.cmd.parse_specs(args.specs, concretize=False)
+    specs = spack.cmd.matching_specs_from_env(specs)
     for spec in specs:
-        _patch(spack.cmd.matching_spec_from_env(spec).package)
+        _patch(spec.package)
 
 
 def _patch_env(env: ev.Environment):

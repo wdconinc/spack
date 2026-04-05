@@ -1,18 +1,14 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 """
-This module implements Version and version-ish objects.  These are:
+This module implements Version and version-ish objects. These are:
 
-StandardVersion: A single version of a package.
-ClosedOpenRange: A range of versions of a package.
-VersionList: A ordered list of Version and VersionRange elements.
-
-The set of Version and ClosedOpenRange is totally ordered wiht <
-defined as Version(x) < VersionRange(Version(y), Version(x))
-if Version(x) <= Version(y).
+* :class:`~spack.version.version_types.StandardVersion`: A single version of a package.
+* :class:`~spack.version.version_types.ClosedOpenRange`: A range of versions of a package.
+* :class:`~spack.version.version_types.VersionList`: A ordered list of Version and VersionRange
+  elements.
 """
 
 from .common import (
@@ -21,15 +17,18 @@ from .common import (
     VersionError,
     VersionLookupError,
     infinity_versions,
+    is_git_commit_sha,
     is_git_version,
 )
 from .version_types import (
     ClosedOpenRange,
+    ConcreteVersion,
     GitVersion,
     StandardVersion,
     Version,
     VersionList,
     VersionRange,
+    VersionType,
     _next_version,
     _prev_version,
     from_string,
@@ -40,21 +39,24 @@ from .version_types import (
 any_version: VersionList = VersionList([":"])
 
 __all__ = [
-    "Version",
-    "VersionRange",
-    "ver",
-    "from_string",
-    "is_git_version",
-    "infinity_versions",
-    "_prev_version",
-    "_next_version",
-    "VersionList",
     "ClosedOpenRange",
-    "StandardVersion",
-    "GitVersion",
-    "VersionError",
-    "VersionChecksumError",
-    "VersionLookupError",
+    "ConcreteVersion",
     "EmptyRangeError",
+    "GitVersion",
+    "StandardVersion",
+    "Version",
+    "VersionChecksumError",
+    "VersionError",
+    "VersionList",
+    "VersionLookupError",
+    "VersionRange",
+    "VersionType",
+    "_next_version",
+    "_prev_version",
     "any_version",
+    "from_string",
+    "infinity_versions",
+    "is_git_commit_sha",
+    "is_git_version",
+    "ver",
 ]

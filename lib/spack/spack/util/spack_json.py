@@ -1,9 +1,8 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
-"""Simple wrapper around JSON to guarantee consistent use of load/dump. """
+"""Simple wrapper around JSON to guarantee consistent use of load/dump."""
 import json
 from typing import Any, Dict, Optional
 
@@ -12,6 +11,7 @@ import spack.error
 __all__ = ["load", "dump", "SpackJSONError"]
 
 _json_dump_args = {"indent": None, "separators": (",", ":")}
+_pretty_dump_args = {"indent": "  ", "separators": (", ", ": ")}
 
 
 def load(stream: Any) -> Dict:
@@ -21,11 +21,12 @@ def load(stream: Any) -> Dict:
     return json.load(stream)
 
 
-def dump(data: Dict, stream: Optional[Any] = None) -> Optional[str]:
+def dump(data: Dict, stream: Optional[Any] = None, pretty: bool = False) -> Optional[str]:
     """Dump JSON with a reasonable amount of indentation and separation."""
+    dump_args = _pretty_dump_args if pretty else _json_dump_args
     if stream is None:
-        return json.dumps(data, **_json_dump_args)  # type: ignore[arg-type]
-    json.dump(data, stream, **_json_dump_args)  # type: ignore[arg-type]
+        return json.dumps(data, **dump_args)  # type: ignore[arg-type]
+    json.dump(data, stream, **dump_args)  # type: ignore[arg-type]
     return None
 
 

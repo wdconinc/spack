@@ -1,15 +1,15 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
-import llnl.util.tty as tty
+import argparse
 
 import spack.cmd.common.arguments
 import spack.cmd.common.confirmation
 import spack.cmd.uninstall
 import spack.deptypes as dt
 import spack.environment as ev
+import spack.llnl.util.tty as tty
 import spack.store
 
 description = "remove specs that are now no longer needed"
@@ -17,7 +17,7 @@ section = "build"
 level = "short"
 
 
-def setup_parser(subparser):
+def setup_parser(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument(
         "-E",
         "--except-any-environment",
@@ -41,7 +41,7 @@ def setup_parser(subparser):
         help="do not remove installed build-only dependencies of roots\n"
         "(default is to keep only link & run dependencies)",
     )
-    spack.cmd.common.arguments.add_common_arguments(subparser, ["yes_to_all"])
+    spack.cmd.common.arguments.add_common_arguments(subparser, ["yes_to_all", "constraint"])
 
 
 def roots_from_environments(args, active_env):
@@ -56,7 +56,6 @@ def roots_from_environments(args, active_env):
 
     # -e says "also preserve things needed by this particular env"
     for env_name_or_dir in args.except_environment:
-        print("HMM", env_name_or_dir)
         if ev.exists(env_name_or_dir):
             env = ev.read(env_name_or_dir)
         elif ev.is_env_dir(env_name_or_dir):
@@ -68,7 +67,7 @@ def roots_from_environments(args, active_env):
     # add root hashes from all considered environments to list of roots
     root_hashes = set()
     for env in all_environments:
-        root_hashes |= set(env.concretized_order)
+        root_hashes |= {x.hash for x in env.concretized_roots}
 
     return root_hashes
 
@@ -92,12 +91,18 @@ def gc(parser, args):
             tty.msg(f"Restricting garbage collection to environment '{active_env.name}'")
             root_hashes = set(spack.store.STORE.db.all_hashes())  # keep everything
             root_hashes -= set(active_env.all_hashes())  # except this env
-            root_hashes |= set(active_env.concretized_order)  # but keep its roots
+            root_hashes |= {x.hash for x in active_env.concretized_roots}  # but keep its roots
         else:
             # consider all explicit specs roots (the default for db.unused_specs())
             root_hashes = None
 
         specs = spack.store.STORE.db.unused_specs(root_hashes=root_hashes, deptype=deptype)
+
+        # limit search to constraint specs if provided
+        if args.constraint:
+            hashes = set(spec.dag_hash() for spec in args.specs())
+            specs = [spec for spec in specs if spec.dag_hash() in hashes]
+
         if not specs:
             tty.msg("There are no unused specs. Spack's store is clean.")
             return

@@ -1,12 +1,11 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 import hashlib
 from typing import BinaryIO, Callable, Dict, Optional
 
-import llnl.util.tty as tty
+import spack.llnl.util.tty as tty
 
 HashFactory = Callable[[], "hashlib._Hash"]
 
@@ -15,7 +14,7 @@ hashes = {"sha256": 32, "md5": 16, "sha1": 20, "sha224": 28, "sha384": 48, "sha5
 # Note: keys are ordered by popularity for earliest return in ``hash_key in version_dict`` checks.
 
 
-#: size of hash digests in bytes, mapped to algoritm names
+#: size of hash digests in bytes, mapped to algorithm names
 _size_to_hash = dict((v, k) for k, v in hashes.items())
 
 
@@ -104,7 +103,7 @@ class Checker:
     with.  e.g., if the digest is 32 hex characters long this will
     use md5.
 
-    Example: know your tarball should hash to 'abc123'.  You want
+    Example: know your tarball should hash to ``abc123``.  You want
     to check files against this.  You would use this class like so::
 
        hexdigest = 'abc123'

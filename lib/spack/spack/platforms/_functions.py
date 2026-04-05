@@ -1,14 +1,8 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
-import contextlib
+import spack.llnl.util.lang
 
-import llnl.util.lang
-
-import spack.util.environment
-
-from .cray import Cray
 from .darwin import Darwin
 from .freebsd import FreeBSD
 from .linux import Linux
@@ -16,26 +10,26 @@ from .test import Test
 from .windows import Windows
 
 #: List of all the platform classes known to Spack
-platforms = [Cray, Darwin, Linux, Windows, FreeBSD, Test]
+platforms = [Darwin, Linux, Windows, FreeBSD, Test]
 
 
-@llnl.util.lang.memoized
+@spack.llnl.util.lang.memoized
 def _host():
     """Detect and return the platform for this machine or None if detection fails."""
     for platform_cls in sorted(platforms, key=lambda plt: plt.priority):
         if platform_cls.detect():
             return platform_cls()
-    return None
+    assert False, "No platform detected. Spack cannot run without a platform."
 
 
 def reset():
     """The result of the host search is memoized. In case it needs to be recomputed
     we must clear the cache, which is what this function does.
     """
-    _host.cache.clear()
+    _host.cache_clear()
 
 
-@llnl.util.lang.memoized
+@spack.llnl.util.lang.memoized
 def cls_by_name(name):
     """Return a platform class that corresponds to the given name or None
     if there is no match.
@@ -58,14 +52,3 @@ def by_name(name):
     """
     platform_cls = cls_by_name(name)
     return platform_cls() if platform_cls else None
-
-
-@contextlib.contextmanager
-def prevent_cray_detection():
-    """Context manager that prevents the detection of the Cray platform"""
-    reset()
-    try:
-        with spack.util.environment.set_env(MODULEPATH=""):
-            yield
-    finally:
-        reset()

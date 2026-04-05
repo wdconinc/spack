@@ -5,12 +5,12 @@ coverage:
   status:
     project:
       default:
-        threshold: 0.2%
+        threshold: 2.0%
 
 ignore:
   - lib/spack/spack/test/.*
   - lib/spack/docs/.*
-  - lib/spack/external/.*
+  - lib/spack/spack/vendor/.*
   - share/spack/qa/.*
 
 comment: off

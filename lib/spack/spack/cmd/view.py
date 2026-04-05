@@ -1,5 +1,4 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
@@ -10,12 +9,12 @@ Spack-installed package file hierarchies.  The union is formed from:
 
 - specs resolved from the package names given by the user (the seeds)
 
-- all dependencies of the seeds unless user specifies `--no-dependencies`
+- all dependencies of the seeds unless user specifies ``--no-dependencies``
 
 - less any specs with names matching the regular expressions given by
-  `--exclude`
+  ``--exclude``
 
-The `view` can be built and tore down via a number of methods (the "actions"):
+The ``view`` can be built and tore down via a number of methods (the "actions"):
 
 - symlink :: a file system view which is a directory hierarchy that is
   the union of the hierarchies of the installed packages in the DAG
@@ -26,25 +25,27 @@ The `view` can be built and tore down via a number of methods (the "actions"):
 - statlink :: a view producing a status report of a symlink or
   hardlink view.
 
-The file system view concept is imspired by Nix, implemented by
-brett.viren@gmail.com ca 2016.
+The file system view concept is inspired by Nix, implemented by
+Brett Viren ca 2016.
 
 All operations on views are performed via proxy objects such as
 YamlFilesystemView.
 
 """
-import llnl.util.tty as tty
-from llnl.util.link_tree import MergeConflictError
+import argparse
+import sys
 
 import spack.cmd
 import spack.environment as ev
+import spack.filesystem_view as fsv
+import spack.llnl.util.tty as tty
 import spack.schema.projections
 import spack.store
 from spack.config import validate
-from spack.filesystem_view import YamlFilesystemView, view_func_parser
+from spack.llnl.util.link_tree import MergeConflictError
 from spack.util import spack_yaml as s_yaml
 
-description = "project packages to a compact naming scheme on the filesystem"
+description = "manipulate view directories in the filesystem"
 section = "environments"
 level = "short"
 
@@ -73,8 +74,8 @@ def disambiguate_in_view(specs, view):
     return list(map(squash, map(spack.store.STORE.db.query, specs)))
 
 
-def setup_parser(sp):
-    setup_parser.parser = sp
+def setup_parser(sp: argparse.ArgumentParser) -> None:
+    setattr(setup_parser, "parser", sp)
 
     sp.add_argument(
         "-v",
@@ -99,8 +100,6 @@ def setup_parser(sp):
     )
 
     ssp = sp.add_subparsers(metavar="ACTION", dest="action")
-
-    specs_opts = dict(metavar="spec", action="store", help="seed specs of the packages to view")
 
     # The action parameterizes the command but in keeping with Spack
     # patterns we make it a subcommand.
@@ -153,39 +152,54 @@ def setup_parser(sp):
             )
 
             # with all option, spec is an optional argument
-            so = specs_opts.copy()
-            so["nargs"] = "*"
-            so["default"] = []
-            grp.add_argument("specs", **so)
+            grp.add_argument(
+                "specs",
+                nargs="*",
+                default=[],
+                metavar="spec",
+                action="store",
+                help="seed specs of the packages to view",
+            )
             grp.add_argument("-a", "--all", action="store_true", help="act on all specs in view")
 
         elif cmd == "statlink":
-            so = specs_opts.copy()
-            so["nargs"] = "*"
-            act.add_argument("specs", **so)
+            act.add_argument(
+                "specs",
+                nargs="*",
+                metavar="spec",
+                action="store",
+                help="seed specs of the packages to view",
+            )
 
         else:
             # without all option, spec is required
-            so = specs_opts.copy()
-            so["nargs"] = "+"
-            act.add_argument("specs", **so)
+            act.add_argument(
+                "specs",
+                nargs="+",
+                metavar="spec",
+                action="store",
+                help="seed specs of the packages to view",
+            )
 
-    for cmd in ["symlink", "hardlink", "copy"]:
+    for cmd in ("symlink", "hardlink", "copy"):
         act = file_system_view_actions[cmd]
         act.add_argument("-i", "--ignore-conflicts", action="store_true")
 
-    return
-
 
 def view(parser, args):
-    "Produce a view of a set of packages."
+    """Produce a view of a set of packages."""
+
+    if sys.platform == "win32" and args.action in ("hardlink", "hard"):
+        # Hard-linked views are not yet allowed on Windows.
+        # See https://github.com/spack/spack/pull/46335#discussion_r1757411915
+        tty.die("Hard linking is not supported on Windows. Please use symlinks or copy methods.")
 
     specs = spack.cmd.parse_specs(args.specs)
     path = args.path[0]
 
     if args.action in actions_link and args.projection_file:
         # argparse confirms file exists
-        with open(args.projection_file, "r") as f:
+        with open(args.projection_file, "r", encoding="utf-8") as f:
             projections_data = s_yaml.load(f)
             validate(projections_data, spack.schema.projections.schema)
             ordered_projections = projections_data["projections"]
@@ -193,17 +207,13 @@ def view(parser, args):
         ordered_projections = {}
 
     # What method are we using for this view
-    if args.action in actions_link:
-        link_fn = view_func_parser(args.action)
-    else:
-        link_fn = view_func_parser("symlink")
-
-    view = YamlFilesystemView(
+    link_type = args.action if args.action in actions_link else "symlink"
+    view = fsv.YamlFilesystemView(
         path,
         spack.store.STORE.layout,
         projections=ordered_projections,
         ignore_conflicts=getattr(args, "ignore_conflicts", False),
-        link=link_fn,
+        link_type=link_type,
         verbose=args.verbose,
     )
 

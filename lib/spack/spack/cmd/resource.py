@@ -1,21 +1,20 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
+import argparse
 import os
 
-import llnl.util.tty as tty
-import llnl.util.tty.color as color
-
+import spack.llnl.util.tty as tty
+import spack.llnl.util.tty.color as color
 import spack.repo
 
-description = "list downloadable resources (tarballs, repos, patches, etc.)"
-section = "basic"
+description = "list downloadable resources (tarballs, repos, patches)"
+section = "query"
 level = "long"
 
 
-def setup_parser(subparser):
+def setup_parser(subparser: argparse.ArgumentParser) -> None:
     sp = subparser.add_subparsers(metavar="SUBCOMMAND", dest="resource_command")
 
     list_parser = sp.add_parser("list", help=resource_list.__doc__)
@@ -29,7 +28,7 @@ def setup_parser(subparser):
 
 def _show_patch(sha256):
     """Show a record from the patch index."""
-    patches = spack.repo.PATH.patch_index.index
+    patches = spack.repo.PATH.get_patch_index().index
     data = patches.get(sha256)
 
     if not data:
@@ -60,7 +59,7 @@ def _show_patch(sha256):
 
 def resource_list(args):
     """list all resources known to spack (currently just patches)"""
-    patches = spack.repo.PATH.patch_index.index
+    patches = spack.repo.PATH.get_patch_index().index
     for sha256 in patches:
         if args.only_hashes:
             print(sha256)

@@ -1,5 +1,4 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
@@ -9,44 +8,46 @@ In a normal Spack installation, this is invoked from the bin/spack script
 after the system path is set up.
 """
 import argparse
+import gc
 import inspect
-import io
+import multiprocessing
 import operator
 import os
-import os.path
 import pstats
 import re
 import shlex
 import signal
-import subprocess as sp
 import sys
+import tempfile
+import textwrap
 import traceback
 import warnings
-from typing import List, Tuple
+from contextlib import contextmanager
+from typing import Any, List, Optional, Set, Tuple
 
-import archspec.cpu
+import spack.vendor.archspec.cpu
 
-import llnl.util.lang
-import llnl.util.tty as tty
-import llnl.util.tty.colify
-import llnl.util.tty.color as color
-from llnl.util.tty.log import log_output
-
+import spack
 import spack.cmd
 import spack.config
+import spack.environment
 import spack.environment as ev
-import spack.modules
+import spack.environment.environment
+import spack.error
+import spack.llnl.util.lang
+import spack.llnl.util.tty as tty
+import spack.llnl.util.tty.colify
+import spack.llnl.util.tty.color as color
 import spack.paths
 import spack.platforms
-import spack.repo
 import spack.solver.asp
 import spack.spec
 import spack.store
 import spack.util.debug
 import spack.util.environment
-import spack.util.git
-import spack.util.path
-from spack.error import SpackError
+import spack.util.lock
+
+from .enums import ConfigScopePriority
 
 #: names of profile statistics
 stat_names = pstats.Stats.sort_arg_dict_default
@@ -55,26 +56,20 @@ stat_names = pstats.Stats.sort_arg_dict_default
 levels = ["short", "long"]
 
 #: intro text for help at different levels
-intro_by_level = {
-    "short": "These are common spack commands:",
-    "long": "Complete list of spack commands:",
-}
+intro_by_level = {"short": "Common spack commands:", "long": "Commands:"}
 
 #: control top-level spack options shown in basic vs. advanced help
-options_by_level = {"short": ["h", "k", "V", "color"], "long": "all"}
+options_by_level = {"short": ["e", "h", "k", "V", "color"], "long": "all"}
 
 #: Longer text for each section, to show in help
 section_descriptions = {
-    "admin": "administration",
-    "basic": "query packages",
-    "build": "build packages",
-    "config": "configuration",
-    "developer": "developer",
+    "query": "query packages",
+    "build": "build, install, and test packages",
     "environment": "environment",
-    "extensions": "extensions",
-    "help": "more help",
+    "config": "configuration",
     "packaging": "create packages",
-    "system": "system",
+    "admin": "administration",
+    "developer": "spack development",
 }
 
 #: preferential command order for some sections (e.g., build pipeline is
@@ -98,73 +93,13 @@ section_order = {
 #: Properties that commands are required to set.
 required_command_properties = ["level", "section", "description"]
 
-#: Recorded directory where spack command was originally invoked
-spack_working_dir = None
 spack_ld_library_path = os.environ.get("LD_LIBRARY_PATH", "")
-
-#: Whether to print backtraces on error
-SHOW_BACKTRACE = False
-
-
-def set_working_dir():
-    """Change the working directory to getcwd, or spack prefix if no cwd."""
-    global spack_working_dir
-    try:
-        spack_working_dir = os.getcwd()
-    except OSError:
-        os.chdir(spack.paths.prefix)
-        spack_working_dir = spack.paths.prefix
 
 
 def add_all_commands(parser):
     """Add all spack subcommands to the parser."""
     for cmd in spack.cmd.all_commands():
         parser.add_command(cmd)
-
-
-def get_spack_commit():
-    """Get the Spack git commit sha.
-
-    Returns:
-        (str or None) the commit sha if available, otherwise None
-    """
-    git_path = os.path.join(spack.paths.prefix, ".git")
-    if not os.path.exists(git_path):
-        return None
-
-    git = spack.util.git.git()
-    if not git:
-        return None
-
-    rev = git(
-        "-C",
-        spack.paths.prefix,
-        "rev-parse",
-        "HEAD",
-        output=str,
-        error=os.devnull,
-        fail_on_error=False,
-    )
-    if git.returncode != 0:
-        return None
-
-    match = re.match(r"[a-f\d]{7,}$", rev)
-    return match.group(0) if match else None
-
-
-def get_version():
-    """Get a descriptive version of this instance of Spack.
-
-    Outputs '<PEP440 version> (<git commit sha>)'.
-
-    The commit sha is only added when available.
-    """
-    version = spack.spack_version
-    commit = get_spack_commit()
-    if commit:
-        version += " ({0})".format(commit)
-
-    return version
 
 
 def index_commands():
@@ -206,6 +141,55 @@ class SpackHelpFormatter(argparse.RawTextHelpFormatter):
             usage = "[-%s] %s" % (chars, usage)
         return usage.strip()
 
+    def start_section(self, heading):
+        return super().start_section(color.colorize(f"@*B{{{heading}}}"))
+
+    def _format_usage(self, usage, actions, groups, prefix=None):
+        # if no optionals or positionals are available, usage is just prog
+        if usage is None and not actions:
+            return super()._format_usage(usage, actions, groups, prefix)
+
+        # add color *after* argparse aligns the text, so as not to interfere
+        result = super()._format_usage(usage, actions, groups, prefix)
+        escaped = color.cescape(result)
+        escaped = escaped.replace(self._prog, f"@.@*C{{{self._prog}}}@c")
+        return color.colorize(f"@B{escaped}@.")
+
+    def add_argument(self, action):
+        if action.help is not argparse.SUPPRESS:
+
+            # find all invocations
+            get_invocation = self._format_action_invocation
+            invocation_lengths = [color.clen(get_invocation(action)) + self._current_indent]
+            for subaction in self._iter_indented_subactions(action):
+                invocation_lengths.append(
+                    color.clen(get_invocation(subaction)) + self._current_indent
+                )
+
+            # update the maximum item length
+            action_length = max(invocation_lengths)
+            self._action_max_length = max(self._action_max_length, action_length)
+
+            # add the item to the list
+            self._add_item(self._format_action, [action])
+
+    def _format_action(self, action):
+        # this is where argparse aligns the help text next to each option
+        help_position = min(self._action_max_length + 2, self._max_help_position)
+
+        result = super()._format_action(action)
+
+        # add color *after* argparse aligns the text, so we don't interfere with lengths
+        if len(result) <= help_position:
+            header, rest = result, ""
+        elif result[help_position - 1] == " ":
+            header, rest = result[:help_position], result[help_position:]
+        else:
+            first_newline = result.index("\n")
+            header, rest = result[:first_newline], result[first_newline:]
+
+        return color.colorize(f"@c{{{color.cescape(header)}}}{color.cescape(rest)}")
+
     def add_arguments(self, actions):
         actions = sorted(actions, key=operator.attrgetter("option_strings"))
         super().add_arguments(actions)
@@ -216,7 +200,7 @@ class SpackArgumentParser(argparse.ArgumentParser):
         """Format help on sections for a particular verbosity level.
 
         Args:
-            level (str): 'short' or 'long' (more commands shown for long)
+            level (str): ``"short"`` or ``"long"`` (more commands shown for long)
         """
         if level not in levels:
             raise ValueError("level must be one of: %s" % levels)
@@ -224,7 +208,7 @@ class SpackArgumentParser(argparse.ArgumentParser):
         # lazily add all commands to the parser when needed.
         add_all_commands(self)
 
-        """Print help on subcommands in neatly formatted sections."""
+        # Print help on subcommands in neatly formatted sections.
         formatter = self._get_formatter()
 
         # Create a list of subcommand actions. Argparse internals are nasty!
@@ -258,24 +242,26 @@ class SpackArgumentParser(argparse.ArgumentParser):
 
         # select only the options for the particular level we're showing.
         show_options = options_by_level[level]
+        options = [
+            opt
+            for group in self._action_groups
+            for opt in group._group_actions
+            if group.title not in ["positional arguments"]
+        ]
+        opts = {opt.option_strings[0].strip("-"): opt for opt in options}
+        actions = [o for o in opts.values()]
         if show_options != "all":
-            opts = dict(
-                (opt.option_strings[0].strip("-"), opt) for opt in self._optionals._group_actions
-            )
-
-            new_actions = [opts[letter] for letter in show_options]
-            self._optionals._group_actions = new_actions
+            actions = [opts[letter] for letter in show_options]
 
         # custom, more concise usage for top level
-        help_options = self._optionals._group_actions
-        help_options = help_options + [self._positionals._group_actions[-1]]
+        help_options = actions + [self._positionals._group_actions[-1]]
         formatter.add_usage(self.usage, help_options, self._mutually_exclusive_groups)
 
         # description
         formatter.add_text(self.description)
 
         # start subcommands
-        formatter.add_text(intro_by_level[level])
+        formatter.add_text(color.colorize(f"@*C{{{intro_by_level[level]}}}"))
 
         # add argument groups based on metadata in commands
         index = index_commands()
@@ -300,21 +286,37 @@ class SpackArgumentParser(argparse.ArgumentParser):
             # add the group to the parser
             add_subcommand_group(group_description, commands)
 
-        # optionals
-        add_group(self._optionals)
+        # start subcommands
+        formatter.add_text(color.colorize("@*C{Options:}"))
+
+        # optionals and user-defined groups
+        for group in sorted(
+            self._action_groups, key=lambda g: (g.title == "help", g.title != "general", g.title)
+        ):
+            if group.title == "positional arguments":
+                continue  # handled by subcommand help above
+
+            filtered_actions = [action for action in group._group_actions if action in actions]
+            if not filtered_actions:
+                continue
+
+            formatter.start_section(group.title)
+            formatter.add_text(group.description)
+
+            formatter.add_arguments(filtered_actions)
+            formatter.end_section()
 
         # epilog
-        formatter.add_text(
+        help_section = textwrap.dedent(
             """\
-{help}:
-  spack help --all       list all commands and options
-  spack help <command>   help on a specific command
-  spack help --spec      help on the package specification syntax
-  spack docs             open https://spack.rtfd.io/ in a browser
-""".format(
-                help=section_descriptions["help"]
-            )
+            @*C{More help}:
+              @c{spack help --all}       list all commands and options
+              @c{spack help <command>}   help on a specific command
+              @c{spack help --spec}      help on the package specification syntax
+              @c{spack docs}             open https://spack.rtfd.io/ in a browser
+            """
         )
+        formatter.add_text(color.colorize(help_section))
 
         # determine help from format above
         return formatter.format_help()
@@ -386,7 +388,7 @@ class SpackArgumentParser(argparse.ArgumentParser):
     def _check_value(self, action, value):
         # converted value must be one of the choices (if specified)
         if action.choices is not None and value not in action.choices:
-            cols = llnl.util.tty.colify.colified(sorted(action.choices), indent=4, tty=True)
+            cols = spack.llnl.util.tty.colify.colified(sorted(action.choices), indent=4, tty=True)
             msg = "invalid choice: %r choose from:\n%s" % (value, cols)
             raise argparse.ArgumentError(action, msg)
 
@@ -394,6 +396,7 @@ class SpackArgumentParser(argparse.ArgumentParser):
 def make_argument_parser(**kwargs):
     """Create an basic argument parser without any subcommands added."""
     parser = SpackArgumentParser(
+        prog="spack",
         formatter_class=SpackHelpFormatter,
         add_help=False,
         description=(
@@ -403,10 +406,30 @@ def make_argument_parser(**kwargs):
         **kwargs,
     )
 
-    # stat names in groups of 7, for nice wrapping.
-    stat_lines = list(zip(*(iter(stat_names),) * 7))
-
-    parser.add_argument(
+    general = parser.add_argument_group("general")
+    general.add_argument(
+        "--color",
+        action="store",
+        default=None,
+        choices=("always", "never", "auto"),
+        help="when to colorize output (default: auto)",
+    )
+    general.add_argument(
+        "-v", "--verbose", action="store_true", help="print additional output during builds"
+    )
+    general.add_argument(
+        "-k",
+        "--insecure",
+        action="store_true",
+        help="do not check ssl certificates when downloading",
+    )
+    general.add_argument(
+        "-b", "--bootstrap", action="store_true", help="use bootstrap config, store, and externals"
+    )
+    general.add_argument(
+        "-V", "--version", action="store_true", help="show version number and exit"
+    )
+    general.add_argument(
         "-h",
         "--help",
         dest="help",
@@ -415,85 +438,92 @@ def make_argument_parser(**kwargs):
         default=None,
         help="show this help message and exit",
     )
-    parser.add_argument(
+    general.add_argument(
         "-H",
         "--all-help",
         dest="help",
         action="store_const",
         const="long",
         default=None,
-        help="show help for all commands (same as spack help --all)",
+        help="show help for all commands (same as `spack help --all`)",
     )
-    parser.add_argument(
-        "--color",
-        action="store",
-        default=os.environ.get("SPACK_COLOR", "auto"),
-        choices=("always", "never", "auto"),
-        help="when to colorize output (default: auto)",
-    )
-    parser.add_argument(
+
+    config = parser.add_argument_group("configuration and environments")
+    config.add_argument(
         "-c",
         "--config",
         default=None,
         action="append",
         dest="config_vars",
-        help="add one or more custom, one off config settings",
+        help="add one or more custom, one-off config settings",
     )
-    parser.add_argument(
+    config.add_argument(
         "-C",
         "--config-scope",
         dest="config_scopes",
         action="append",
-        metavar="DIR",
-        help="add a custom configuration scope",
+        metavar="DIR|ENV",
+        help="add directory or environment as read-only config scope",
     )
-    parser.add_argument(
-        "-d",
-        "--debug",
-        action="count",
-        default=0,
-        help="write out debug messages\n\n(more d's for more verbosity: -d, -dd, -ddd, etc.)",
+    envs = config  # parser.add_argument_group("environments")
+    env_mutex = envs.add_mutually_exclusive_group()
+    env_mutex.add_argument(
+        "-e", "--env", dest="env", metavar="ENV", action="store", help="run with an environment"
     )
-    parser.add_argument("--timestamp", action="store_true", help="add a timestamp to tty output")
-    parser.add_argument("--pdb", action="store_true", help="run spack under the pdb debugger")
-
-    env_group = parser.add_mutually_exclusive_group()
-    env_group.add_argument(
-        "-e",
-        "--env",
-        dest="env",
-        metavar="ENV",
-        action="store",
-        help="run with a specific environment (see spack env)",
-    )
-    env_group.add_argument(
+    env_mutex.add_argument(
         "-D",
         "--env-dir",
         dest="env_dir",
         metavar="DIR",
         action="store",
-        help="run with an environment directory (ignore managed environments)",
+        help="run with environment in directory (ignore managed envs)",
     )
-    env_group.add_argument(
+    env_mutex.add_argument(
         "-E",
         "--no-env",
         dest="no_env",
         action="store_true",
         help="run without any environments activated (see spack env)",
     )
-    parser.add_argument(
+    envs.add_argument(
         "--use-env-repo",
         action="store_true",
-        help="when running in an environment, use its package repository",
+        help="when in an environment, use its package repository",
     )
 
-    parser.add_argument(
-        "-k",
-        "--insecure",
-        action="store_true",
-        help="do not check ssl certificates when downloading",
+    debug = parser.add_argument_group("debug")
+    debug.add_argument(
+        "-d",
+        "--debug",
+        action="count",
+        default=0,
+        help="write out debug messages\n\n(more d's for more verbosity: -d, -dd, -ddd, etc.)",
     )
-    parser.add_argument(
+    debug.add_argument(
+        "-t",
+        "--backtrace",
+        action="store_true",
+        default="SPACK_BACKTRACE" in os.environ,
+        help="always show backtraces for exceptions",
+    )
+    debug.add_argument("--pdb", action="store_true", help="run spack under the pdb debugger")
+    debug.add_argument("--timestamp", action="store_true", help="add a timestamp to tty output")
+    debug.add_argument(
+        "-m", "--mock", action="store_true", help="use mock packages instead of real ones"
+    )
+    debug.add_argument(
+        "--print-shell-vars", action="store", help="print info needed by setup-env.*sh"
+    )
+    debug.add_argument(
+        "--stacktrace",
+        action="store_true",
+        default="SPACK_STACKTRACE" in os.environ,
+        help="add stacktraces to all printed statements",
+    )
+
+    locks = general
+    lock_mutex = locks.add_mutually_exclusive_group()
+    lock_mutex.add_argument(
         "-l",
         "--enable-locks",
         action="store_true",
@@ -501,76 +531,50 @@ def make_argument_parser(**kwargs):
         default=None,
         help="use filesystem locking (default)",
     )
-    parser.add_argument(
+    lock_mutex.add_argument(
         "-L",
         "--disable-locks",
         action="store_false",
         dest="locks",
         help="do not use filesystem locking (unsafe)",
     )
-    parser.add_argument(
-        "-m", "--mock", action="store_true", help="use mock packages instead of real ones"
-    )
-    parser.add_argument(
-        "-b",
-        "--bootstrap",
-        action="store_true",
-        help="use bootstrap configuration (bootstrap store, config, externals)",
-    )
-    parser.add_argument(
+
+    profile = parser.add_argument_group("profiling")
+    profile.add_argument(
         "-p",
         "--profile",
         action="store_true",
         dest="spack_profile",
         help="profile execution using cProfile",
     )
-    parser.add_argument(
+    profile.add_argument("--profile-file", default=None, help="Filename to save profile data to.")
+    profile.add_argument(
         "--sorted-profile",
         default=None,
         metavar="STAT",
-        help=f"profile and sort\n\none or more of: {stat_lines[0]}",
+        help="profile and sort by STAT, which can be: calls, ncalls,\n"
+        "cumtime, cumulative, filename, line, module",
     )
-    parser.add_argument(
+    profile.add_argument(
         "--lines",
         default=20,
         action="store",
         help="lines of profile output or 'all' (default: 20)",
     )
-    parser.add_argument(
-        "-v", "--verbose", action="store_true", help="print additional output during builds"
-    )
-    parser.add_argument(
-        "--stacktrace",
-        action="store_true",
-        default="SPACK_STACKTRACE" in os.environ,
-        help="add stacktraces to all printed statements",
-    )
-    parser.add_argument(
-        "--backtrace",
-        action="store_true",
-        default="SPACK_BACKTRACE" in os.environ,
-        help="always show backtraces for exceptions",
-    )
-    parser.add_argument(
-        "-V", "--version", action="store_true", help="show version number and exit"
-    )
-    parser.add_argument(
-        "--print-shell-vars", action="store", help="print info needed by setup-env.*sh"
-    )
 
     return parser
 
 
-def send_warning_to_tty(message, *args):
+def showwarning(message, category, filename, lineno, file=None, line=None):
     """Redirects messages to tty.warn."""
-    tty.warn(message)
+    if category is spack.error.SpackAPIWarning:
+        tty.warn(f"{filename}:{lineno}: {message}")
+    else:
+        tty.warn(message)
 
 
 def setup_main_options(args):
     """Configure spack globals based on the basic options."""
-    # Assign a custom function to show warnings
-    warnings.showwarning = send_warning_to_tty
-
     # Set up environment based on args.
     tty.set_verbose(args.verbose)
     tty.set_debug(args.debug)
@@ -581,8 +585,7 @@ def setup_main_options(args):
 
     if args.debug or args.backtrace:
         spack.error.debug = True
-        global SHOW_BACKTRACE
-        SHOW_BACKTRACE = True
+        spack.error.SHOW_BACKTRACE = True
 
     if args.debug:
         spack.util.debug.register_interrupt_handler()
@@ -606,7 +609,6 @@ def setup_main_options(args):
         spack.config.CONFIG.scopes["command_line"].sections["repos"] = syaml.syaml_dict(
             [(key, [spack.paths.mock_packages_path])]
         )
-        spack.repo.PATH = spack.repo.create(spack.config.CONFIG)
 
     # If the user asked for it, don't check ssl certs.
     if args.insecure:
@@ -622,14 +624,15 @@ def setup_main_options(args):
     # with color
     color.try_enable_terminal_color_on_windows()
     # when to use color (takes always, auto, or never)
-    color.set_color_when(args.color)
+    if args.color is not None:
+        color.set_color_when(args.color)
 
 
 def allows_unknown_args(command):
     """Implements really simple argument injection for unknown arguments.
 
     Commands may add an optional argument called "unknown args" to
-    indicate they can handle unknonwn args, and we'll pass the unknown
+    indicate they can handle unknown args, and we'll pass the unknown
     args in.
     """
     info = dict(inspect.getmembers(command))
@@ -652,116 +655,114 @@ def _invoke_command(command, parser, args, unknown_args):
 
 
 class SpackCommand:
-    """Callable object that invokes a spack command (for testing).
+    """Callable object that invokes a Spack command (for testing).
 
     Example usage::
 
-        install = SpackCommand('install')
-        install('-v', 'mpich')
+        install = SpackCommand("install")
+        install("-v", "mpich")
 
-    Use this to invoke Spack commands directly from Python and check
-    their output.
-    """
+    Use this to invoke Spack commands directly from Python and check their output."""
 
-    def __init__(self, command_name, subprocess=False):
+    def __init__(self, command_name: str) -> None:
         """Create a new SpackCommand that invokes ``command_name`` when called.
 
         Args:
-            command_name (str): name of the command to invoke
-            subprocess (bool): whether to fork a subprocess or not. Currently not supported on
-                Windows, where it is always False.
+            command_name: name of the command to invoke
         """
         self.parser = make_argument_parser()
         self.command_name = command_name
-        # TODO: figure out how to support this on windows
-        self.subprocess = subprocess if sys.platform != "win32" else False
+        #: Return code of the last command invocation
+        self.returncode: Any = None
+        #: Error raised during the last command invocation, if any
+        self.error: Optional[BaseException] = None
+        #: Binary output captured from the last command invocation
+        self.binary_output = b""
+        #: Decoded output captured from the last command invocation
+        self.output = ""
 
-    def __call__(self, *argv, **kwargs):
-        """Invoke this SpackCommand.
+    def __call__(self, *argv: str, capture: bool = True, fail_on_error: bool = True) -> str:
+        """Invoke this SpackCommand. Returns the combined stdout/stderr.
 
         Args:
-            argv (list): command line arguments.
+            argv: command line arguments.
 
         Keyword Args:
-            fail_on_error (optional bool): Don't raise an exception on error
-            global_args (optional list): List of global spack arguments:
-                simulates ``spack [global_args] [command] [*argv]``
+            capture: Capture output from the command
+            fail_on_error: Don't raise an exception on error
 
-        Returns:
-            (str): combined output and error as a string
-
-        On return, if ``fail_on_error`` is False, return value of command
-        is set in ``returncode`` property, and the error is set in the
-        ``error`` property.  Otherwise, raise an error.
-        """
-        # set these before every call to clear them out
+        On return, if ``fail_on_error`` is False, return value of command is set in ``returncode``
+        property, and the error is set in the ``error`` property.  Otherwise, raise an error."""
         self.returncode = None
         self.error = None
+        self.binary_output = b""
+        self.output = ""
 
-        prepend = kwargs["global_args"] if "global_args" in kwargs else []
-        fail_on_error = kwargs.get("fail_on_error", True)
+        try:
+            with self.capture_output(enable=capture):
+                command = self.parser.add_command(self.command_name)
+                args, unknown = self.parser.parse_known_args([self.command_name, *argv])
+                setup_main_options(args)
+                self.returncode = _invoke_command(command, self.parser, args, unknown)
+        except SystemExit as e:
+            # When the command calls sys.exit instead of returning an exit code
+            self.error = e
+            self.returncode = e.code
+        except BaseException as e:
+            # For other exceptions, raise the original exception if fail_on_error is True
+            self.error = e
+            if fail_on_error:
+                raise
+        finally:
+            self.output = self.binary_output.decode("utf-8", errors="replace")
 
-        if self.subprocess:
-            p = sp.Popen(
-                [spack.paths.spack_script] + prepend + [self.command_name] + list(argv),
-                stdout=sp.PIPE,
-                stderr=sp.STDOUT,
-            )
-            out, self.returncode = p.communicate()
-            out = out.decode()
-        else:
-            command = self.parser.add_command(self.command_name)
-            args, unknown = self.parser.parse_known_args(
-                prepend + [self.command_name] + list(argv)
-            )
+        if fail_on_error and self.returncode not in (0, None):
+            raise SpackCommandError(self.returncode, self.output) from self.error
 
-            out = io.StringIO()
+        return self.output
+
+    @contextmanager
+    def capture_output(self, enable: bool = True):
+        """Captures stdout and stderr from the current process and all subprocesses. This uses a
+        temporary file and os.dup2 to redirect file descriptors."""
+        if not enable:
+            yield self
+            return
+        with tempfile.TemporaryFile(mode="w+b") as tmp_file:
+            # sys.stdout and sys.stderr may have been replaced with file objects under pytest, so
+            # redirect their file descriptors in addition to the original fds 1 and 2.
+            fds: Set[int] = {sys.stdout.fileno(), sys.stderr.fileno(), 1, 2}
+            saved_fds = {fd: os.dup(fd) for fd in fds}
+            sys.stdout.flush()
+            sys.stderr.flush()
+            for fd in fds:
+                os.dup2(tmp_file.fileno(), fd)
             try:
-                with log_output(out, echo=True):
-                    self.returncode = _invoke_command(command, self.parser, args, unknown)
-
-            except SystemExit as e:
-                self.returncode = e.code
-
-            except BaseException as e:
-                tty.debug(e)
-                self.error = e
-                if fail_on_error:
-                    self._log_command_output(out)
-                    raise
-            out = out.getvalue()
-
-        if fail_on_error and self.returncode not in (None, 0):
-            self._log_command_output(out)
-            raise SpackCommandError(
-                "Command exited with code %d: %s(%s)"
-                % (self.returncode, self.command_name, ", ".join("'%s'" % a for a in argv))
-            )
-
-        return out
-
-    def _log_command_output(self, out):
-        if tty.is_verbose():
-            fmt = self.command_name + ": {0}"
-            for ln in out.getvalue().split("\n"):
-                if len(ln) > 0:
-                    tty.verbose(fmt.format(ln.replace("==> ", "")))
+                yield self
+            finally:
+                sys.stdout.flush()
+                sys.stderr.flush()
+                for fd, saved_fd in saved_fds.items():
+                    os.dup2(saved_fd, fd)
+                    os.close(saved_fd)
+                tmp_file.seek(0)
+                self.binary_output = tmp_file.read()
 
 
-def _profile_wrapper(command, parser, args, unknown_args):
+def _profile_wrapper(command, main_args, parser, args, unknown_args):
     import cProfile
 
     try:
-        nlines = int(args.lines)
+        nlines = int(main_args.lines)
     except ValueError:
-        if args.lines != "all":
-            tty.die("Invalid number for --lines: %s" % args.lines)
+        if main_args.lines != "all":
+            tty.die("Invalid number for --lines: %s" % main_args.lines)
         nlines = -1
 
     # allow comma-separated list of fields
     sortby = ["time"]
-    if args.sorted_profile:
-        sortby = args.sorted_profile.split(",")
+    if main_args.sorted_profile:
+        sortby = main_args.sorted_profile.split(",")
         for stat in sortby:
             if stat not in stat_names:
                 tty.die("Invalid sort field: %s" % stat)
@@ -775,20 +776,23 @@ def _profile_wrapper(command, parser, args, unknown_args):
     finally:
         pr.disable()
 
+        if main_args.profile_file:
+            pr.dump_stats(main_args.profile_file)
+
         # print out profile stats.
         stats = pstats.Stats(pr, stream=sys.stderr)
         stats.sort_stats(*sortby)
         stats.print_stats(nlines)
 
 
-@llnl.util.lang.memoized
+@spack.llnl.util.lang.memoized
 def _compatible_sys_types():
     """Return a list of all the platform-os-target tuples compatible
     with the current host.
     """
     host_platform = spack.platforms.host()
-    host_os = str(host_platform.operating_system("default_os"))
-    host_target = archspec.cpu.host()
+    host_os = str(host_platform.default_operating_system())
+    host_target = spack.vendor.archspec.cpu.host()
     compatible_targets = [host_target] + host_target.ancestors
 
     compatible_archs = [
@@ -803,11 +807,13 @@ def print_setup_info(*info):
 
     Args:
         info (list): list of things to print: comma-separated list
-            of 'csh', 'sh', or 'modules'
+            of ``"csh"``, ``"sh"``, or ``"modules"``
 
     This is in ``main.py`` to make it fast; the setup scripts need to
     invoke spack in login scripts, and it needs to be quick.
     """
+    from spack.modules.common import root_path
+
     shell = "csh" if "csh" in info else "sh"
 
     def shell_set(var, value):
@@ -824,7 +830,7 @@ def print_setup_info(*info):
     # print roots for all module systems
     module_to_roots = {"tcl": list(), "lmod": list()}
     for name in module_to_roots.keys():
-        path = spack.modules.common.root_path(name, "default")
+        path = root_path(name, "default")
         module_to_roots[name].append(path)
 
     other_spack_instances = spack.config.get("upstreams") or {}
@@ -846,7 +852,7 @@ def print_setup_info(*info):
     # print environment module system if available. This can be expensive
     # on clusters, so skip it if not needed.
     if "modules" in info:
-        generic_arch = archspec.cpu.host().family
+        generic_arch = spack.vendor.archspec.cpu.host().family
         module_spec = "environment-modules target={0}".format(generic_arch)
         specs = spack.store.STORE.db.query(module_spec)
         if specs:
@@ -857,10 +863,10 @@ def print_setup_info(*info):
 
 def restore_macos_dyld_vars():
     """
-    Spack mutates DYLD_* variables in `spack load` and `spack env activate`.
+    Spack mutates ``DYLD_*`` variables in ``spack load`` and ``spack env activate``.
     Unlike Linux, macOS SIP clears these variables in new processes, meaning
-    that os.environ["DYLD_*"] in our Python process is not the same as the user's
-    shell. Therefore, we store the user's DYLD_* variables in SPACK_DYLD_* and
+    that ``os.environ["DYLD_*"]`` in our Python process is not the same as the user's
+    shell. Therefore, we store the user's ``DYLD_*`` variables in ``SPACK_DYLD_*`` and
     restore them here.
     """
     if not sys.platform == "darwin":
@@ -912,6 +918,38 @@ def resolve_alias(cmd_name: str, cmd: List[str]) -> Tuple[str, List[str]]:
     return cmd_name, cmd
 
 
+# sentinel scope marker for environments passed on the command line
+_ENV = object()
+
+
+def add_command_line_scopes(
+    cfg: spack.config.Configuration, command_line_scopes: List[str]
+) -> None:
+    """Add additional scopes from the ``--config-scope`` argument, either envs or dirs.
+
+    Args:
+        cfg: configuration instance
+        command_line_scopes: list of configuration scope paths
+
+    Raises:
+        spack.error.ConfigError: if the path is an invalid configuration scope
+    """
+    for i, path in enumerate(command_line_scopes):
+        name = f"cmd_scope_{i}"
+        scope = ev.environment_path_scope(name, path)
+        if scope is None:
+            if os.path.isdir(path):  # directory with config files
+                cfg.push_scope(
+                    spack.config.DirectoryConfigScope(name, path, writable=False),
+                    priority=ConfigScopePriority.CUSTOM,
+                )
+                continue
+            else:
+                raise spack.error.ConfigError(f"Invalid configuration scope: {path}")
+
+        cfg.push_scope(scope, priority=ConfigScopePriority.CUSTOM)
+
+
 def _main(argv=None):
     """Logic for the main entry point for the Spack command.
 
@@ -932,9 +970,10 @@ def _main(argv=None):
     # main() is tricky to get right, so be careful where you put things.
     #
     # Things in this first part of `main()` should *not* require any
-    # configuration. This doesn't include much -- setting up th parser,
+    # configuration. This doesn't include much -- setting up the parser,
     # restoring some key environment variables, very simple CLI options, etc.
     # ------------------------------------------------------------------------
+    warnings.showwarning = showwarning
 
     # Create a parser with a simple positional argument first.  We'll
     # lazily load the subcommand(s) we need later. This allows us to
@@ -952,7 +991,7 @@ def _main(argv=None):
 
     # version is special as it does not require a command or loading and additional infrastructure
     if args.version:
-        print(get_version())
+        print(spack.get_version())
         return 0
 
     # ------------------------------------------------------------------------
@@ -965,25 +1004,42 @@ def _main(argv=None):
     # Make spack load / env activate work on macOS
     restore_macos_dyld_vars()
 
-    # make spack.config aware of any command line configuration scopes
-    if args.config_scopes:
-        spack.config.COMMAND_LINE_SCOPES = args.config_scopes
-
-    # ensure options on spack command come before everything
-    setup_main_options(args)
-
-    # activate an environment if one was specified on the command line
+    # store any error that occurred loading an env
     env_format_error = None
+    env = None
+
+    # try to find an active environment here, so that we can activate it later
     if not args.no_env:
         try:
             env = spack.cmd.find_environment(args)
-            if env:
-                ev.activate(env, args.use_env_repo)
-        except spack.config.ConfigFormatError as e:
+        except (spack.config.ConfigFormatError, ev.SpackEnvironmentConfigError) as e:
             # print the context but delay this exception so that commands like
             # `spack config edit` can still work with a bad environment.
             e.print_context()
             env_format_error = e
+
+    def add_environment_scope():
+        if env_format_error:
+            # Allow command to continue without env in case it is `spack config edit`
+            # All other cases will raise in `finish_parse_and_run`
+            spack.environment.environment._active_environment_error = env_format_error
+            return
+        # do not call activate here, as it has a lot of expensive function calls to deal
+        # with mutation of spack.config.CONFIG -- but we are still building the config.
+        env.manifest.prepare_config_scope()
+        spack.environment.environment._active_environment = env
+
+    # add the environment
+    if env:
+        add_environment_scope()
+
+    # Push scopes from the command line last
+    if args.config_scopes:
+        add_command_line_scopes(spack.config.CONFIG, args.config_scopes)
+    spack.config.CONFIG.push_scope(
+        spack.config.InternalConfigScope("command_line"), priority=ConfigScopePriority.COMMAND_LINE
+    )
+    setup_main_options(args)
 
     # ------------------------------------------------------------------------
     # Things that require configuration should go below here
@@ -1011,7 +1067,7 @@ def _main(argv=None):
     # set up a bootstrap context, if asked.
     # bootstrap context needs to include parsing the command, b/c things
     # like `ConstraintAction` and `ConfigSetAction` happen at parse time.
-    bootstrap_context = llnl.util.lang.nullcontext()
+    bootstrap_context = spack.llnl.util.lang.nullcontext()
     if args.bootstrap:
         import spack.bootstrap as bootstrap  # avoid circular imports
 
@@ -1028,6 +1084,7 @@ def finish_parse_and_run(parser, cmd_name, main_args, env_format_error):
     args, unknown = parser.parse_known_args(main_args.command)
     # we need to inherit verbose since the install command checks for it
     args.verbose = main_args.verbose
+    args.lines = main_args.lines
 
     # Now that we know what command this is and what its args are, determine
     # whether we can continue with a bad environment and raise if not.
@@ -1037,11 +1094,11 @@ def finish_parse_and_run(parser, cmd_name, main_args, env_format_error):
             raise env_format_error
 
     # many operations will fail without a working directory.
-    set_working_dir()
+    spack.paths.set_working_dir()
 
     # now we can actually execute the command.
-    if main_args.spack_profile or main_args.sorted_profile:
-        _profile_wrapper(command, parser, args, unknown)
+    if main_args.spack_profile or main_args.sorted_profile or main_args.profile_file:
+        _profile_wrapper(command, main_args, parser, args, unknown)
     elif main_args.pdb:
         import pdb
 
@@ -1064,31 +1121,86 @@ def main(argv=None):
             the executable name. If None, parses from sys.argv.
 
     """
+    # When using the forkserver start method, preload the following modules to improve startup
+    # time of child processes.
+    multiprocessing.set_forkserver_preload(["spack.main", "spack.package", "spack.new_installer"])
     try:
+        g0, g1, g2 = gc.get_threshold()
+        gc.set_threshold(50 * g0, g1, g2)
         return _main(argv)
 
-    except SpackError as e:
+    except spack.solver.asp.OutputDoesNotSatisfyInputError as e:
+        _handle_solver_bug(e)
+        return 1
+
+    except spack.error.SpackError as e:
         tty.debug(e)
         e.die()  # gracefully die on any SpackErrors
 
     except KeyboardInterrupt:
-        if spack.config.get("config:debug") or SHOW_BACKTRACE:
+        if spack.config.get("config:debug") or spack.error.SHOW_BACKTRACE:
             raise
         sys.stderr.write("\n")
         tty.error("Keyboard interrupt.")
         return signal.SIGINT.value
 
     except SystemExit as e:
-        if spack.config.get("config:debug") or SHOW_BACKTRACE:
+        if spack.config.get("config:debug") or spack.error.SHOW_BACKTRACE:
             traceback.print_exc()
         return e.code
 
     except Exception as e:
-        if spack.config.get("config:debug") or SHOW_BACKTRACE:
+        if spack.config.get("config:debug") or spack.error.SHOW_BACKTRACE:
             raise
         tty.error(e)
         return 3
 
 
+def _handle_solver_bug(
+    e: spack.solver.asp.OutputDoesNotSatisfyInputError, out=sys.stderr, root=None
+) -> None:
+    # when the solver outputs specs that do not satisfy the input and spack is used as a command
+    # line tool, we dump the incorrect output specs to json so users can upload them in bug reports
+    wrong_output = [(input, output) for input, output in e.input_to_output if output is not None]
+    no_output = [input for input, output in e.input_to_output if output is None]
+    if no_output:
+        tty.error(
+            "internal solver error: the following specs were not solved:\n    - "
+            + "\n    - ".join(str(s) for s in no_output),
+            stream=out,
+        )
+    if wrong_output:
+        msg = "internal solver error: the following specs were concretized, but do not satisfy "
+        msg += "the input:\n"
+        for in_spec, out_spec in wrong_output:
+            msg += f"    - input: {in_spec}\n"
+            msg += f"      output: {out_spec.long_spec}\n"
+        msg += "\n    Please report a bug at https://github.com/spack/spack/issues"
+
+        # try to write the input/output specs to a temporary directory for bug reports
+        try:
+            tmpdir = tempfile.mkdtemp(prefix="spack-asp-", dir=root)
+            files = []
+            for i, (input, output) in enumerate(wrong_output, start=1):
+                in_file = os.path.join(tmpdir, f"input-{i}.json")
+                out_file = os.path.join(tmpdir, f"output-{i}.json")
+                files.append(in_file)
+                files.append(out_file)
+                with open(in_file, "w", encoding="utf-8") as f:
+                    input.to_json(f)
+                with open(out_file, "w", encoding="utf-8") as f:
+                    output.to_json(f)
+
+            msg += " and attach the following files:\n    - " + "\n    - ".join(files)
+        except Exception:
+            msg += "."
+        tty.error(msg, stream=out)
+
+
 class SpackCommandError(Exception):
-    """Raised when SpackCommand execution fails."""
+    """Raised when SpackCommand execution fails, replacing SystemExit."""
+
+    def __init__(self, code, output):
+        self.code = code
+        self.output = output
+        super().__init__(f"Spack command failed with exit code {code}")

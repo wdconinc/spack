@@ -1,5 +1,4 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
@@ -7,9 +6,8 @@
 
 An install tree, or "build store" consists of two parts:
 
-  1. A package database that tracks what is installed.
-  2. A directory layout that determines how the installations
-     are laid out.
+1. A package database that tracks what is installed.
+2. A directory layout that determines how the installations are laid out.
 
 The store contains all the install prefixes for packages installed by
 Spack.  The simplest store could just contain prefixes named by DAG hash,
@@ -22,37 +20,32 @@ import os
 import pathlib
 import re
 import uuid
-from typing import Any, Callable, Dict, Generator, List, Optional, Union
-
-import llnl.util.lang
-from llnl.util import tty
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 
 import spack.config
 import spack.database
 import spack.directory_layout
 import spack.error
+import spack.llnl.util.lang
 import spack.paths
 import spack.spec
 import spack.util.path
+from spack.llnl.util import tty
 
 #: default installation root, relative to the Spack install path
 DEFAULT_INSTALL_TREE_ROOT = os.path.join(spack.paths.opt_path, "spack")
 
 
-ConfigurationType = Union["spack.config.Configuration", "llnl.util.lang.Singleton"]
-
-
-def parse_install_tree(config_dict):
+def parse_install_tree(config_dict: dict) -> Tuple[str, str, Dict[str, str]]:
     """Parse config settings and return values relevant to the store object.
 
     Arguments:
-        config_dict (dict): dictionary of config values, as returned from
-            spack.config.get('config')
+        config_dict: dictionary of config values, as returned from ``spack.config.get("config")``
 
     Returns:
-        (tuple): triple of the install tree root, the unpadded install tree
-            root (before padding was applied), and the projections for the
-            install tree
+        triple of the install tree root, the unpadded install tree
+        root (before padding was applied), and the projections for the
+        install tree
 
     Encapsulate backwards compatibility capabilities for install_tree
     and deprecated values that are now parsed as part of install_tree.
@@ -73,7 +66,7 @@ def parse_install_tree(config_dict):
 
     install_tree = config_dict.get("install_tree", {})
 
-    padded_length = False
+    padded_length: Union[bool, int] = False
     if isinstance(install_tree, str):
         tty.warn("Using deprecated format for configuring install_tree")
         unpadded_root = install_tree
@@ -173,7 +166,12 @@ class Store:
         self.hash_length = hash_length
         self.upstreams = upstreams
         self.lock_cfg = lock_cfg
-        self.db = spack.database.Database(root, upstream_dbs=upstreams, lock_cfg=lock_cfg)
+        self.layout = spack.directory_layout.DirectoryLayout(
+            root, projections=projections, hash_length=hash_length
+        )
+        self.db = spack.database.Database(
+            root, upstream_dbs=upstreams, lock_cfg=lock_cfg, layout=self.layout
+        )
 
         timeout_format_str = (
             f"{str(lock_cfg.package_timeout)}s" if lock_cfg.package_timeout else "No timeout"
@@ -187,13 +185,13 @@ class Store:
             self.root, default_timeout=lock_cfg.package_timeout
         )
 
-        self.layout = spack.directory_layout.DirectoryLayout(
-            root, projections=projections, hash_length=hash_length
-        )
+    def has_padding(self) -> bool:
+        """Returns True if the store layout includes path padding."""
+        return self.root != self.unpadded_root
 
     def reindex(self) -> None:
         """Convenience function to reindex the store DB with its own layout."""
-        return self.db.reindex(self.layout)
+        return self.db.reindex()
 
     def __reduce__(self):
         return Store, (
@@ -206,20 +204,20 @@ class Store:
         )
 
 
-def create(configuration: ConfigurationType) -> Store:
+def create(configuration: spack.config.Configuration) -> Store:
     """Create a store from the configuration passed as input.
 
     Args:
         configuration: configuration to create a store.
     """
     configuration = configuration or spack.config.CONFIG
-    config_dict = configuration.get("config")
+    config_dict = configuration.get_config("config")
     root, unpadded_root, projections = parse_install_tree(config_dict)
-    hash_length = configuration.get("config:install_hash_length")
+    hash_length = config_dict.get("install_hash_length")
 
     install_roots = [
         install_properties["install_tree"]
-        for install_properties in configuration.get("upstreams", {}).values()
+        for install_properties in configuration.get_config("upstreams").values()
     ]
     upstreams = _construct_upstream_dbs_from_install_roots(install_roots)
 
@@ -239,7 +237,7 @@ def _create_global() -> Store:
 
 
 #: Singleton store instance
-STORE: Union[Store, llnl.util.lang.Singleton] = llnl.util.lang.Singleton(_create_global)
+STORE: Store = spack.llnl.util.lang.Singleton(_create_global)  # type: ignore
 
 
 def reinitialize():
@@ -249,7 +247,7 @@ def reinitialize():
     global STORE
 
     token = STORE
-    STORE = llnl.util.lang.Singleton(_create_global)
+    STORE = spack.llnl.util.lang.Singleton(_create_global)
 
     return token
 
@@ -261,7 +259,7 @@ def restore(token):
 
 
 def _construct_upstream_dbs_from_install_roots(
-    install_roots: List[str], _test: bool = False
+    install_roots: List[str],
 ) -> List[spack.database.Database]:
     accumulated_upstream_dbs: List[spack.database.Database] = []
     for install_root in reversed(install_roots):
@@ -271,7 +269,6 @@ def _construct_upstream_dbs_from_install_roots(
             is_upstream=True,
             upstream_dbs=upstream_dbs,
         )
-        next_db._fail_when_missing_deps = _test
         next_db._read()
         accumulated_upstream_dbs.insert(0, next_db)
 
@@ -307,7 +304,7 @@ def find(
 
     matching_specs: List[spack.spec.Spec] = []
     errors = []
-    query_fn = query_fn or spack.store.STORE.db.query
+    query_fn = query_fn or STORE.db.query
     for spec in constraints:
         current_matches = query_fn(spec, **kwargs)
 
@@ -337,10 +334,10 @@ def specfile_matches(filename: str, **kwargs) -> List["spack.spec.Spec"]:
 
     Args:
         filename: YAML or JSON file from which to read the query.
-        **kwargs: keyword arguments forwarded to "find"
+        **kwargs: keyword arguments forwarded to :func:`find`
     """
     query = [spack.spec.Spec.from_specfile(filename)]
-    return spack.store.find(query, **kwargs)
+    return find(query, **kwargs)
 
 
 def ensure_singleton_created() -> None:
@@ -356,7 +353,7 @@ def use_store(
 
     Args:
         path: path to the store.
-        extra_data: extra configuration under "config:install_tree" to be
+        extra_data: extra configuration under ``config:install_tree`` to be
             taken into account.
 
     Yields:
@@ -371,7 +368,6 @@ def use_store(
         data.update(extra_data)
 
     # Swap the store with the one just constructed and return it
-    ensure_singleton_created()
     spack.config.CONFIG.push_scope(
         spack.config.InternalConfigScope(name=scope_name, data={"config": {"install_tree": data}})
     )

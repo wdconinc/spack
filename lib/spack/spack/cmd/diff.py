@@ -1,27 +1,25 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 
+import argparse
 import sys
-
-import llnl.util.tty as tty
-from llnl.util.tty.color import cprint, get_color_when
 
 import spack.cmd
 import spack.environment as ev
+import spack.llnl.util.tty as tty
 import spack.solver.asp as asp
-import spack.util.environment
 import spack.util.spack_json as sjson
 from spack.cmd.common import arguments
+from spack.llnl.util.tty.color import cprint, get_color_when
 
 description = "compare two specs"
-section = "basic"
+section = "query"
 level = "long"
 
 
-def setup_parser(subparser):
+def setup_parser(subparser: argparse.ArgumentParser) -> None:
     arguments.add_common_arguments(subparser, ["specs"])
 
     subparser.add_argument(
@@ -49,12 +47,12 @@ def setup_parser(subparser):
     )
 
 
-def shift(asp_function):
+def shift(asp_function: asp.AspFunction) -> asp.AspFunction:
     """Transforms ``attr("foo", "bar")`` into ``foo("bar")``."""
-    if not asp_function.args:
+    args = asp_function.args
+    if not args:
         raise ValueError(f"Can't shift ASP function with no arguments: {str(asp_function)}")
-    first, *rest = asp_function.args
-    return asp.AspFunction(first, rest)
+    return asp.AspFunction(args[0], args[1:])
 
 
 def compare_specs(a, b, to_string=False, color=None, ignore_packages=None):
@@ -91,12 +89,16 @@ def compare_specs(a, b, to_string=False, color=None, ignore_packages=None):
     # specs and to descend into dependency hashes so we include all facts.
     a_facts = set(
         shift(func)
-        for func in setup.spec_clauses(a, body=True, expand_hashes=True, concrete_build_deps=True)
+        for func in setup.spec_clauses(
+            a, body=True, expand_hashes=True, concrete_build_deps=True, include_runtimes=True
+        )
         if func.name == "attr"
     )
     b_facts = set(
         shift(func)
-        for func in setup.spec_clauses(b, body=True, expand_hashes=True, concrete_build_deps=True)
+        for func in setup.spec_clauses(
+            b, body=True, expand_hashes=True, concrete_build_deps=True, include_runtimes=True
+        )
         if func.name == "attr"
     )
 

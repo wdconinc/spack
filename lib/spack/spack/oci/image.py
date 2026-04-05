@@ -1,13 +1,10 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 import re
 import urllib.parse
 from typing import Optional, Union
-
-import spack.spec
 
 # notice: Docker is more strict (no uppercase allowed). We parse image names *with* uppercase
 # and normalize, so: example.com/Organization/Name -> example.com/organization/name. Tags are
@@ -51,6 +48,11 @@ def ensure_sha256_checksum(oci_blob: str):
     return checksum
 
 
+def is_oci_url(url: str) -> bool:
+    """Check if the URL is an OCI URL."""
+    return url.startswith("oci://") or url.startswith("oci+http://")
+
+
 class Digest:
     """Represents a digest in the format <algorithm>:<digest>.
     Currently only supports sha256 digests."""
@@ -83,18 +85,25 @@ class ImageReference:
     The digest is optional, and domain and tag are automatically
     filled out with defaults when parsed from string."""
 
-    __slots__ = ["domain", "name", "tag", "digest"]
+    __slots__ = ["scheme", "domain", "name", "tag", "digest"]
 
     def __init__(
-        self, *, domain: str, name: str, tag: str = "latest", digest: Optional[Digest] = None
+        self,
+        *,
+        domain: str,
+        name: str,
+        tag: str = "latest",
+        digest: Optional[Digest] = None,
+        scheme: str = "https",
     ):
+        self.scheme = scheme
         self.domain = domain
         self.name = name
         self.tag = tag
         self.digest = digest
 
     @classmethod
-    def from_string(cls, string) -> "ImageReference":
+    def from_string(cls, string: str, *, scheme: str = "https") -> "ImageReference":
         match = referencePat.match(string)
         if not match:
             raise ValueError(f"Invalid image reference: {string}")
@@ -145,36 +154,53 @@ class ImageReference:
         if isinstance(digest, str):
             digest = Digest.from_string(digest)
 
-        return cls(domain=domain, name=name, tag=tag, digest=digest)
+        return cls(domain=domain, name=name, tag=tag, digest=digest, scheme=scheme)
+
+    @classmethod
+    def from_url(cls, url: str) -> "ImageReference":
+        """Parse an OCI URL into an ImageReference, either oci:// or oci+http://."""
+        if url.startswith("oci://"):
+            img = url[6:]
+            scheme = "https"
+        elif url.startswith("oci+http://"):
+            img = url[11:]
+            scheme = "http"
+        else:
+            raise ValueError(f"Invalid OCI URL: {url}")
+        return cls.from_string(img, scheme=scheme)
 
     def manifest_url(self) -> str:
         digest_or_tag = self.digest or self.tag
-        return f"https://{self.domain}/v2/{self.name}/manifests/{digest_or_tag}"
+        return f"{self.scheme}://{self.domain}/v2/{self.name}/manifests/{digest_or_tag}"
 
     def blob_url(self, digest: Union[str, Digest]) -> str:
         if isinstance(digest, str):
             digest = Digest.from_string(digest)
-        return f"https://{self.domain}/v2/{self.name}/blobs/{digest}"
+        return f"{self.scheme}://{self.domain}/v2/{self.name}/blobs/{digest}"
 
     def with_digest(self, digest: Union[str, Digest]) -> "ImageReference":
         if isinstance(digest, str):
             digest = Digest.from_string(digest)
-        return ImageReference(domain=self.domain, name=self.name, tag=self.tag, digest=digest)
+        return ImageReference(
+            domain=self.domain, name=self.name, tag=self.tag, digest=digest, scheme=self.scheme
+        )
 
     def with_tag(self, tag: str) -> "ImageReference":
-        return ImageReference(domain=self.domain, name=self.name, tag=tag, digest=self.digest)
+        return ImageReference(
+            domain=self.domain, name=self.name, tag=tag, digest=self.digest, scheme=self.scheme
+        )
 
     def uploads_url(self, digest: Optional[Digest] = None) -> str:
-        url = f"https://{self.domain}/v2/{self.name}/blobs/uploads/"
+        url = f"{self.scheme}://{self.domain}/v2/{self.name}/blobs/uploads/"
         if digest:
             url += f"?digest={digest}"
         return url
 
     def tags_url(self) -> str:
-        return f"https://{self.domain}/v2/{self.name}/tags/list"
+        return f"{self.scheme}://{self.domain}/v2/{self.name}/tags/list"
 
     def endpoint(self, path: str = "") -> str:
-        return urllib.parse.urljoin(f"https://{self.domain}/v2/", path)
+        return urllib.parse.urljoin(f"{self.scheme}://{self.domain}/v2/", path)
 
     def __str__(self) -> str:
         s = f"{self.domain}/{self.name}"
@@ -192,29 +218,16 @@ class ImageReference:
             and self.name == __value.name
             and self.tag == __value.tag
             and self.digest == __value.digest
+            and self.scheme == __value.scheme
         )
 
 
-def _ensure_valid_tag(tag: str) -> str:
+def ensure_valid_tag(tag: str) -> str:
     """Ensure a tag is valid for an OCI registry."""
     sanitized = re.sub(r"[^\w.-]", "_", tag)
     if len(sanitized) > 128:
         return sanitized[:64] + sanitized[-64:]
     return sanitized
-
-
-def default_tag(spec: "spack.spec.Spec") -> str:
-    """Return a valid, default image tag for a spec."""
-    return _ensure_valid_tag(f"{spec.name}-{spec.version}-{spec.dag_hash()}.spack")
-
-
-#: Default OCI index tag
-default_index_tag = "index.spack"
-
-
-def tag_is_spec(tag: str) -> bool:
-    """Check if a tag is likely a Spec"""
-    return tag.endswith(".spack") and tag != default_index_tag
 
 
 def default_config(architecture: str, os: str):

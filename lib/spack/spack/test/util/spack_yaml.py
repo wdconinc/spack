@@ -1,5 +1,4 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
@@ -22,7 +21,7 @@ def check_blame(element, file_name, line=None):
     """Check that `config blame config` gets right file/line for an element.
 
     This runs `spack config blame config` and scrapes the output for a
-    particular YAML key. It thne checks that the requested file/line info
+    particular YAML key. It then checks that the requested file/line info
     is also on that line.
 
     Line is optional; if it is ``None`` we just check for the
@@ -73,7 +72,7 @@ def test_config_blame_defaults():
 
     def get_file_lines(filename):
         if filename not in files:
-            with open(filename, "r") as f:
+            with open(filename, "r", encoding="utf-8") as f:
                 files[filename] = [""] + f.read().split("\n")
         return files[filename]
 

@@ -1,5 +1,4 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
@@ -7,11 +6,11 @@ import os
 
 import pytest
 
-import archspec.cpu
+import spack.vendor.archspec.cpu
 
+import spack.concretize
 import spack.modules.common
 import spack.modules.tcl
-import spack.spec
 
 mpich_spec_string = "mpich@3.0.4"
 mpileaks_spec_string = "mpileaks"
@@ -26,7 +25,7 @@ pytestmark = [
 ]
 
 
-@pytest.mark.usefixtures("config", "mock_packages", "mock_module_filename")
+@pytest.mark.usefixtures("mutable_config", "mock_packages", "mock_module_filename")
 class TestTcl:
     def test_simple_case(self, modulefile_content, module_configuration):
         """Tests the generation of a simple Tcl module file."""
@@ -43,11 +42,12 @@ class TestTcl:
         content = modulefile_content(mpileaks_spec_string)
 
         assert (
-            len([x for x in content if "if {![info exists ::env(LMOD_VERSION_MAJOR)]} {" in x])
-            == 1
+            len([x for x in content if "if {![llength [info commands depends-on]]} {" in x]) == 1
         )
-        assert len([x for x in content if "depends-on " in x]) == 2
-        assert len([x for x in content if "module load " in x]) == 2
+        assert len([x for x in content if "    proc depends-on {args} {" in x]) == 1
+        assert len([x for x in content if "        module load {*}$args" in x]) == 1
+        # depends-on command defined once and used 3 times
+        assert len([x for x in content if "depends-on " in x]) == 4
 
         # dtbuild1 has
         # - 1 ('run',) dependency
@@ -57,11 +57,12 @@ class TestTcl:
         content = modulefile_content("dtbuild1")
 
         assert (
-            len([x for x in content if "if {![info exists ::env(LMOD_VERSION_MAJOR)]} {" in x])
-            == 1
+            len([x for x in content if "if {![llength [info commands depends-on]]} {" in x]) == 1
         )
-        assert len([x for x in content if "depends-on " in x]) == 2
-        assert len([x for x in content if "module load " in x]) == 2
+        assert len([x for x in content if "    proc depends-on {args} {" in x]) == 1
+        assert len([x for x in content if "        module load {*}$args" in x]) == 1
+        # depends-on command defined once and used twice
+        assert len([x for x in content if "depends-on " in x]) == 3
 
         # The configuration file sets the verbose keyword to False
         messages = [x for x in content if 'puts stderr "Autoloading' in x]
@@ -74,11 +75,12 @@ class TestTcl:
         content = modulefile_content(mpileaks_spec_string)
 
         assert (
-            len([x for x in content if "if {![info exists ::env(LMOD_VERSION_MAJOR)]} {" in x])
-            == 1
+            len([x for x in content if "if {![llength [info commands depends-on]]} {" in x]) == 1
         )
-        assert len([x for x in content if "depends-on " in x]) == 5
-        assert len([x for x in content if "module load " in x]) == 5
+        assert len([x for x in content if "    proc depends-on {args} {" in x]) == 1
+        assert len([x for x in content if "        module load {*}$args" in x]) == 1
+        # depends-on command defined once and used 6 times
+        assert len([x for x in content if "depends-on " in x]) == 7
 
         # dtbuild1 has
         # - 1 ('run',) dependency
@@ -88,11 +90,12 @@ class TestTcl:
         content = modulefile_content("dtbuild1")
 
         assert (
-            len([x for x in content if "if {![info exists ::env(LMOD_VERSION_MAJOR)]} {" in x])
-            == 1
+            len([x for x in content if "if {![llength [info commands depends-on]]} {" in x]) == 1
         )
-        assert len([x for x in content if "depends-on " in x]) == 2
-        assert len([x for x in content if "module load " in x]) == 2
+        assert len([x for x in content if "    proc depends-on {args} {" in x]) == 1
+        assert len([x for x in content if "        module load {*}$args" in x]) == 1
+        # depends-on command defined once and used twice
+        assert len([x for x in content if "depends-on " in x]) == 3
 
     def test_prerequisites_direct(
         self, modulefile_content, module_configuration, host_architecture_str
@@ -102,7 +105,7 @@ class TestTcl:
         module_configuration("prerequisites_direct")
         content = modulefile_content(f"mpileaks target={host_architecture_str}")
 
-        assert len([x for x in content if "prereq" in x]) == 2
+        assert len([x for x in content if "prereq" in x]) == 3
 
     def test_prerequisites_all(
         self, modulefile_content, module_configuration, host_architecture_str
@@ -112,11 +115,8 @@ class TestTcl:
         module_configuration("prerequisites_all")
         content = modulefile_content(f"mpileaks target={host_architecture_str}")
 
-        assert len([x for x in content if "prereq" in x]) == 5
+        assert len([x for x in content if "prereq" in x]) == 6
 
-    @pytest.mark.skipif(
-        str(archspec.cpu.host().family) != "x86_64", reason="test data is specific for x86_64"
-    )
     def test_alter_environment(self, modulefile_content, module_configuration):
         """Tests modifications to run-time environment."""
 
@@ -136,7 +136,6 @@ class TestTcl:
         assert len([x for x in content if "setenv FOO {foo}" in x]) == 0
         assert len([x for x in content if "unsetenv BAR" in x]) == 0
         assert len([x for x in content if "depends-on foo/bar" in x]) == 1
-        assert len([x for x in content if "module load foo/bar" in x]) == 1
         assert len([x for x in content if "setenv LIBDWARF_ROOT" in x]) == 1
 
     def test_prepend_path_separator(self, modulefile_content, module_configuration):
@@ -145,14 +144,14 @@ class TestTcl:
         module_configuration("module_path_separator")
         content = modulefile_content("module-path-separator")
 
-        assert len([x for x in content if "append-path COLON {foo}" in x]) == 1
-        assert len([x for x in content if "prepend-path COLON {foo}" in x]) == 1
-        assert len([x for x in content if "remove-path COLON {foo}" in x]) == 1
-        assert len([x for x in content if "append-path --delim {;} SEMICOLON {bar}" in x]) == 1
-        assert len([x for x in content if "prepend-path --delim {;} SEMICOLON {bar}" in x]) == 1
-        assert len([x for x in content if "remove-path --delim {;} SEMICOLON {bar}" in x]) == 1
-        assert len([x for x in content if "append-path --delim { } SPACE {qux}" in x]) == 1
-        assert len([x for x in content if "remove-path --delim { } SPACE {qux}" in x]) == 1
+        assert len([x for x in content if "append-path -d {:} COLON {foo}" in x]) == 1
+        assert len([x for x in content if "prepend-path -d {:} COLON {foo}" in x]) == 1
+        assert len([x for x in content if "remove-path -d {:} COLON {foo}" in x]) == 1
+        assert len([x for x in content if "append-path -d {;} SEMICOLON {bar}" in x]) == 1
+        assert len([x for x in content if "prepend-path -d {;} SEMICOLON {bar}" in x]) == 1
+        assert len([x for x in content if "remove-path -d {;} SEMICOLON {bar}" in x]) == 1
+        assert len([x for x in content if "append-path -d { } SPACE {qux}" in x]) == 1
+        assert len([x for x in content if "remove-path -d { } SPACE {qux}" in x]) == 1
 
     @pytest.mark.regression("11355")
     def test_manpath_setup(self, modulefile_content, module_configuration):
@@ -166,13 +165,16 @@ class TestTcl:
 
         # manpath set by module with prepend-path
         content = modulefile_content("module-manpath-prepend")
-        assert len([x for x in content if "prepend-path MANPATH {/path/to/man}" in x]) == 1
-        assert len([x for x in content if "prepend-path MANPATH {/path/to/share/man}" in x]) == 1
+        assert len([x for x in content if "prepend-path -d {:} MANPATH {/path/to/man}" in x]) == 1
+        assert (
+            len([x for x in content if "prepend-path -d {:} MANPATH {/path/to/share/man}" in x])
+            == 1
+        )
         assert len([x for x in content if "append-path MANPATH {}" in x]) == 1
 
         # manpath set by module with append-path
         content = modulefile_content("module-manpath-append")
-        assert len([x for x in content if "append-path MANPATH {/path/to/man}" in x]) == 1
+        assert len([x for x in content if "append-path -d {:} MANPATH {/path/to/man}" in x]) == 1
         assert len([x for x in content if "append-path MANPATH {}" in x]) == 1
 
         # manpath set by module with setenv
@@ -190,7 +192,8 @@ class TestTcl:
         assert len([x for x in content if "setenv FOO {{{name}}, {name}, {{}}, {}}" in x]) == 1
 
     @pytest.mark.skipif(
-        str(archspec.cpu.host().family) != "x86_64", reason="test data is specific for x86_64"
+        str(spack.vendor.archspec.cpu.host().family) != "x86_64",
+        reason="test data is specific for x86_64",
     )
     def test_help_message(self, modulefile_content, module_configuration):
         """Tests the generation of module help message."""
@@ -240,17 +243,16 @@ class TestTcl:
         module_configuration("exclude")
         content = modulefile_content("mpileaks ^zmpi")
 
-        assert len([x for x in content if "module load " in x]) == 1
+        # depends-on command defined once and used twice
+        assert len([x for x in content if "depends-on " in x]) == 3
 
-        # Catch "Exception" to avoid using FileNotFoundError on Python 3
-        # and IOError on Python 2 or common bases like EnvironmentError
-        # which are not officially documented
-        with pytest.raises(Exception):
+        with pytest.raises(FileNotFoundError):
             modulefile_content(f"callpath target={host_architecture_str}")
 
         content = modulefile_content(f"zmpi target={host_architecture_str}")
 
-        assert len([x for x in content if "module load " in x]) == 1
+        # depends-on command defined once and used twice
+        assert len([x for x in content if "depends-on " in x]) == 3
 
     def test_naming_scheme_compat(self, factory, module_configuration):
         """Tests backwards compatibility for naming_scheme key"""
@@ -334,14 +336,16 @@ class TestTcl:
         with pytest.raises(spack.modules.common.ModulesError):
             modulefile_content("mpileaks")
 
-    def test_module_index(self, module_configuration, factory, tmpdir_factory):
+    def test_module_index(
+        self, module_configuration, factory, tmp_path_factory: pytest.TempPathFactory
+    ):
         module_configuration("suffix")
 
         w1, s1 = factory("mpileaks")
         w2, s2 = factory("callpath")
         w3, s3 = factory("openblas")
 
-        test_root = str(tmpdir_factory.mktemp("module-root"))
+        test_root = str(tmp_path_factory.mktemp("module-root"))
 
         spack.modules.common.generate_module_index(test_root, [w1, w2])
 
@@ -380,6 +384,14 @@ class TestTcl:
         writer, spec = factory("mpileaks~debug+opt target=x86_64")
         assert "baz-foo-bar" in writer.layout.use_name
 
+    def test_suffixes_format(self, module_configuration, factory):
+        """Tests adding suffixes as spec format string to module file name."""
+        module_configuration("suffix-format")
+
+        writer, spec = factory("mpileaks +debug target=x86_64 ^mpich@3.0.4")
+        assert "debug=True" in writer.layout.use_name
+        assert "mpi=mpich-v3.0.4" in writer.layout.use_name
+
     def test_setup_environment(self, modulefile_content, module_configuration):
         """Tests the internal set-up of run-time environment."""
 
@@ -389,9 +401,8 @@ class TestTcl:
         assert len([x for x in content if "setenv FOOBAR" in x]) == 1
         assert len([x for x in content if "setenv FOOBAR {mpileaks}" in x]) == 1
 
-        spec = spack.spec.Spec("mpileaks")
-        spec.concretize()
-        content = modulefile_content(str(spec["callpath"]))
+        spec = spack.concretize.concretize_one("mpileaks")
+        content = modulefile_content(spec["callpath"])
 
         assert len([x for x in content if "setenv FOOBAR" in x]) == 1
         assert len([x for x in content if "setenv FOOBAR {callpath}" in x]) == 1
@@ -442,19 +453,19 @@ class TestTcl:
 
     @pytest.mark.regression("4400")
     @pytest.mark.db
-    def test_hide_implicits_no_arg(self, module_configuration, database):
+    def test_hide_implicits_no_arg(self, module_configuration, mutable_database):
         module_configuration("exclude_implicits")
 
         # mpileaks has been installed explicitly when setting up
         # the tests database
-        mpileaks_specs = database.query("mpileaks")
+        mpileaks_specs = mutable_database.query("mpileaks")
         for item in mpileaks_specs:
             writer = writer_cls(item, "default")
             assert not writer.conf.excluded
 
         # callpath is a dependency of mpileaks, and has been pulled
         # in implicitly
-        callpath_specs = database.query("callpath")
+        callpath_specs = mutable_database.query("callpath")
         for item in callpath_specs:
             writer = writer_cls(item, "default")
             assert writer.conf.excluded
@@ -464,37 +475,34 @@ class TestTcl:
         module_configuration("exclude_implicits")
 
         # mpileaks is defined as explicit with explicit argument set on writer
-        mpileaks_spec = spack.spec.Spec("mpileaks")
-        mpileaks_spec.concretize()
+        mpileaks_spec = spack.concretize.concretize_one("mpileaks")
         writer = writer_cls(mpileaks_spec, "default", True)
         assert not writer.conf.excluded
 
         # callpath is defined as implicit with explicit argument set on writer
-        callpath_spec = spack.spec.Spec("callpath")
-        callpath_spec.concretize()
+        callpath_spec = spack.concretize.concretize_one("callpath")
         writer = writer_cls(callpath_spec, "default", False)
         assert writer.conf.excluded
 
     @pytest.mark.regression("9624")
-    @pytest.mark.db
-    def test_autoload_with_constraints(self, modulefile_content, module_configuration, database):
+    def test_autoload_with_constraints(self, modulefile_content, module_configuration):
         """Tests the automatic loading of direct dependencies."""
 
         module_configuration("autoload_with_constraints")
 
         # Test the mpileaks that should have the autoloaded dependencies
         content = modulefile_content("mpileaks ^mpich2")
-        assert len([x for x in content if "depends-on " in x]) == 2
-        assert len([x for x in content if "module load " in x]) == 2
+        # depends-on command defined once and used 3 times
+        assert len([x for x in content if "depends-on " in x]) == 4
 
         # Test the mpileaks that should NOT have the autoloaded dependencies
         content = modulefile_content("mpileaks ^mpich")
         assert (
-            len([x for x in content if "if {![info exists ::env(LMOD_VERSION_MAJOR)]} {" in x])
-            == 0
+            len([x for x in content if "if {![llength [info commands depends-on]]} {" in x]) == 0
         )
+        assert len([x for x in content if "    proc depends-on {args} {" in x]) == 0
+        assert len([x for x in content if "        module load {*}$args" in x]) == 0
         assert len([x for x in content if "depends-on " in x]) == 0
-        assert len([x for x in content if "module load " in x]) == 0
 
     def test_modules_no_arch(self, factory, module_configuration):
         module_configuration("no_arch")
@@ -507,20 +515,20 @@ class TestTcl:
         """Tests the addition and removal of hide command in modulerc."""
         module_configuration("hide_implicits")
 
-        spec = spack.spec.Spec("mpileaks@2.3").concretized()
+        spec = spack.concretize.concretize_one("mpileaks@2.3")
 
         # mpileaks is defined as implicit, thus hide command should appear in modulerc
         writer = writer_cls(spec, "default", False)
         writer.write()
         assert os.path.exists(writer.layout.modulerc)
-        with open(writer.layout.modulerc) as f:
+        with open(writer.layout.modulerc, encoding="utf-8") as f:
             content = [line.strip() for line in f.readlines()]
         hide_implicit_mpileaks = f"module-hide --soft --hidden-loaded {writer.layout.use_name}"
         assert len([x for x in content if hide_implicit_mpileaks == x]) == 1
 
         # The direct dependencies are all implicit, and they should have depends-on with fixed
         # 7 character hash, even though the config is set to hash_length = 0.
-        with open(writer.layout.filename) as f:
+        with open(writer.layout.filename, encoding="utf-8") as f:
             depends_statements = [line.strip() for line in f.readlines() if "depends-on" in line]
             for dep in spec.dependencies(deptype=("link", "run")):
                 assert any(dep.dag_hash(7) in line for line in depends_statements)
@@ -530,7 +538,7 @@ class TestTcl:
         writer = writer_cls(spec, "default", True)
         writer.write()
         assert os.path.exists(writer.layout.modulerc)
-        with open(writer.layout.modulerc) as f:
+        with open(writer.layout.modulerc, encoding="utf-8") as f:
             content = [line.strip() for line in f.readlines()]
         assert hide_implicit_mpileaks in content  # old, implicit mpileaks is still hidden
         assert f"module-hide --soft --hidden-loaded {writer.layout.use_name}" not in content
@@ -554,14 +562,14 @@ class TestTcl:
         # three versions of mpileaks are implicit
         writer = writer_cls(spec, "default", False)
         writer.write(overwrite=True)
-        spec_alt1 = spack.spec.Spec("mpileaks@2.2").concretized()
-        spec_alt2 = spack.spec.Spec("mpileaks@2.1").concretized()
+        spec_alt1 = spack.concretize.concretize_one("mpileaks@2.2")
+        spec_alt2 = spack.concretize.concretize_one("mpileaks@2.1")
         writer_alt1 = writer_cls(spec_alt1, "default", False)
         writer_alt1.write(overwrite=True)
         writer_alt2 = writer_cls(spec_alt2, "default", False)
         writer_alt2.write(overwrite=True)
         assert os.path.exists(writer.layout.modulerc)
-        with open(writer.layout.modulerc) as f:
+        with open(writer.layout.modulerc, encoding="utf-8") as f:
             content = [line.strip() for line in f.readlines()]
         hide_cmd = f"module-hide --soft --hidden-loaded {writer.layout.use_name}"
         hide_cmd_alt1 = f"module-hide --soft --hidden-loaded {writer_alt1.layout.use_name}"
@@ -573,7 +581,7 @@ class TestTcl:
         # one version is removed
         writer_alt1.remove()
         assert os.path.exists(writer.layout.modulerc)
-        with open(writer.layout.modulerc) as f:
+        with open(writer.layout.modulerc, encoding="utf-8") as f:
             content = [line.strip() for line in f.readlines()]
         assert len([x for x in content if hide_cmd == x]) == 1
         assert len([x for x in content if hide_cmd_alt1 == x]) == 0

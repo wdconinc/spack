@@ -1,16 +1,14 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 """Manages the details on the images used in the various stages."""
 import json
-import os.path
+import os
 import shlex
 import sys
 
-import llnl.util.filesystem as fs
-import llnl.util.tty as tty
-
+import spack.llnl.util.filesystem as fs
+import spack.llnl.util.tty as tty
 import spack.util.git
 
 #: Global variable used to cache in memory the content of images.json
@@ -27,7 +25,7 @@ def data():
     if not _data:
         json_dir = os.path.abspath(os.path.dirname(__file__))
         json_file = os.path.join(json_dir, "images.json")
-        with open(json_file) as f:
+        with open(json_file, encoding="utf-8") as f:
             _data = json.load(f)
     return _data
 
@@ -37,7 +35,7 @@ def build_info(image, spack_version):
 
     Args:
         image (str): image to be used at run-time. Should be of the form
-            <image_name>:<image_tag> e.g. "ubuntu:18.04"
+            <image_name>:<image_tag> e.g. ``"ubuntu:18.04"``
         spack_version (str): version of Spack that we want to use to build
 
     Returns:
@@ -59,10 +57,10 @@ def os_package_manager_for(image):
 
     Args:
         image (str): image to be used at run-time. Should be of the form
-            <image_name>:<image_tag> e.g. "ubuntu:18.04"
+            <image_name>:<image_tag> e.g. ``"ubuntu:18.04"``
 
     Returns:
-        Name of the package manager, e.g. "apt" or "yum"
+        Name of the package manager, e.g. ``"apt"`` or ``"yum"``
     """
     name = data()["images"][image]["os_package_manager"]
     return name

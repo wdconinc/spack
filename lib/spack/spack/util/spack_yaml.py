@@ -1,5 +1,4 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
@@ -9,48 +8,40 @@
   us to access file and line information later.
 
 - ``Our load methods use ``OrderedDict`` class instead of YAML's
-  default unorderd dict.
+  default unordered dict.
 
 """
-import collections
-import collections.abc
-import copy
 import ctypes
 import enum
 import functools
 import io
 import re
-from typing import IO, List, Optional
+from typing import IO, Any, Callable, Dict, List, Optional, Union
 
-import ruamel.yaml
-from ruamel.yaml import comments, constructor, emitter, error, representer
-
-from llnl.util.tty.color import cextra, clen, colorize
+from spack.vendor.ruamel.yaml import YAML, comments, constructor, emitter, error, representer
 
 import spack.error
+from spack.llnl.util.tty.color import cextra, clen, colorize
 
 # Only export load and dump
 __all__ = ["load", "dump", "SpackYAMLError"]
 
 
 # Make new classes so we can add custom attributes.
-# Also, use OrderedDict instead of just dict.
-class syaml_dict(collections.OrderedDict):
-    def __repr__(self):
-        mappings = (f"{k!r}: {v!r}" for k, v in self.items())
-        return "{%s}" % ", ".join(mappings)
+class syaml_dict(dict):
+    pass
 
 
 class syaml_list(list):
-    __repr__ = list.__repr__
+    pass
 
 
 class syaml_str(str):
-    __repr__ = str.__repr__
+    pass
 
 
 class syaml_int(int):
-    __repr__ = int.__repr__
+    pass
 
 
 #: mapping from syaml type -> primitive type
@@ -70,6 +61,53 @@ def syaml_type(obj):
         if type(obj) is not bool and isinstance(obj, t):
             return syaml_t(obj) if type(obj) is not syaml_t else obj
     return obj
+
+
+class DictWithLineInfo(dict):
+    """A dictionary that preserves YAML line information."""
+
+    __slots__ = ("line_info",)
+
+    def __init__(self, *args, line_info: str = "", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.line_info = line_info
+
+
+def _represent_dict_with_line_info(dumper, data):
+    return dumper.represent_dict(data)
+
+
+def deepcopy_as_builtin(obj: Any, *, line_info: bool = False) -> Any:
+    """Deep copies a YAML object as built-in types (dict, list, str, int, ...).
+
+    Args:
+        obj: object to be copied
+        line_info: if ``True``, add line information to the copied object
+    """
+    if isinstance(obj, str):
+        return str(obj)
+    elif isinstance(obj, dict):
+        result = DictWithLineInfo()
+        result.update(
+            {
+                deepcopy_as_builtin(k): deepcopy_as_builtin(v, line_info=line_info)
+                for k, v in obj.items()
+            }
+        )
+        if line_info:
+            result.line_info = _line_info(obj)
+        return result
+    elif isinstance(obj, list):
+        return [deepcopy_as_builtin(x, line_info=line_info) for x in obj]
+    elif isinstance(obj, bool):
+        return bool(obj)
+    elif isinstance(obj, int):
+        return int(obj)
+    elif isinstance(obj, float):
+        return float(obj)
+    elif obj is None:
+        return obj
+    raise ValueError(f"cannot convert {type(obj)} to built-in type")
 
 
 def markable(obj):
@@ -233,17 +271,19 @@ def return_string_when_no_stream(func):
 @return_string_when_no_stream
 def dump(data, stream=None, default_flow_style=False):
     handler = ConfigYAML(yaml_type=YAMLType.GENERIC_YAML)
-    handler.default_flow_style = default_flow_style
-    handler.width = maxint
+    handler.yaml.default_flow_style = default_flow_style
+    handler.yaml.width = maxint
     return handler.dump(data, stream=stream)
 
 
-def file_line(mark):
+def _line_info(obj):
     """Format a mark as <file>:<line> information."""
-    result = mark.name
-    if mark.line:
-        result += ":" + str(mark.line)
-    return result
+    m = get_mark_from_yaml_data(obj)
+    if m is None:
+        return ""
+    if m.line:
+        return f"{m.name}:{m.line:d}"
+    return m.name
 
 
 #: Global for interactions between LineAnnotationDumper and dump_annotated().
@@ -296,8 +336,8 @@ class LineAnnotationEmitter(emitter.Emitter):
         if marked(self.event.value):
             self.saved = self.event.value
 
-    def write_line_break(self):
-        super().write_line_break()
+    def write_line_break(self, data=None):
+        super().write_line_break(data)
         if self.saved is None:
             _ANNOTATIONS.append(colorize("@K{---}"))
             return
@@ -339,7 +379,7 @@ class ConfigYAML:
     """Handles the loading and dumping of Spack's YAML files."""
 
     def __init__(self, yaml_type: YAMLType) -> None:
-        self.yaml = ruamel.yaml.YAML(typ="rt", pure=True)
+        self.yaml = YAML(typ="rt", pure=True)
         if yaml_type == YAMLType.GENERIC_YAML:
             self.yaml.Representer = SafeRepresenter
         elif yaml_type == YAMLType.ANNOTATED_SPACK_CONFIG_FILE:
@@ -349,6 +389,7 @@ class ConfigYAML:
         else:
             self.yaml.Representer = OrderedLineRepresenter
             self.yaml.Constructor = OrderedLineConstructor
+        self.yaml.Representer.add_representer(DictWithLineInfo, _represent_dict_with_line_info)
 
     def load(self, stream: IO):
         """Loads the YAML data from a stream and returns it.
@@ -367,15 +408,19 @@ class ConfigYAML:
             error_mark = e.context_mark if e.context_mark else e.problem_mark
             if error_mark:
                 line, column = error_mark.line, error_mark.column
-                msg += f": near {error_mark.name}, {str(line)}, {str(column)}"
+                filename = error_mark.name
+                msg += f": near {filename}, {str(line)}, {str(column)}"
             else:
+                filename = stream.name
                 msg += f": {stream.name}"
             msg += f": {e.problem}"
-            raise SpackYAMLError(msg, e) from e
+
+            raise SpackYAMLError(msg, e, filename) from e
 
         except Exception as e:
             msg = "cannot load Spack YAML configuration"
-            raise SpackYAMLError(msg, e) from e
+            filename = stream.name
+            raise SpackYAMLError(msg, e, filename) from e
 
     def dump(self, data, stream: Optional[IO] = None, *, transform=None) -> None:
         """Dumps the YAML data to a stream.
@@ -391,27 +436,14 @@ class ConfigYAML:
             return self.yaml.dump(data, stream=stream, transform=transform)
         except Exception as e:
             msg = "cannot dump Spack YAML configuration"
-            raise SpackYAMLError(msg, str(e)) from e
+            filename = stream.name if stream else None
+            raise SpackYAMLError(msg, str(e), filename) from e
 
     def as_string(self, data) -> str:
         """Returns a string representing the YAML data passed as input."""
         result = io.StringIO()
         self.dump(data, stream=result)
         return result.getvalue()
-
-
-def deepcopy(data):
-    """Returns a deepcopy of the input YAML data."""
-    result = copy.deepcopy(data)
-
-    if isinstance(result, comments.CommentedMap):
-        # HACK to fully copy ruamel CommentedMap that doesn't provide copy
-        # method. Especially necessary for environments
-        extracted_comments = extract_comments(data)
-        if extracted_comments:
-            set_comments(result, data_comments=extracted_comments)
-
-    return result
 
 
 def load_config(str_or_file):
@@ -431,10 +463,12 @@ def dump_config(data, stream, *, default_flow_style=False, blame=False):
     if blame:
         handler = ConfigYAML(yaml_type=YAMLType.ANNOTATED_SPACK_CONFIG_FILE)
         handler.yaml.default_flow_style = default_flow_style
+        handler.yaml.width = maxint
         return _dump_annotated(handler, data, stream)
 
     handler = ConfigYAML(yaml_type=YAMLType.SPACK_CONFIG_FILE)
     handler.yaml.default_flow_style = default_flow_style
+    handler.yaml.width = maxint
     return handler.dump(data, stream)
 
 
@@ -455,27 +489,20 @@ def _dump_annotated(handler, data, stream=None):
     width = max(clen(a) for a in _ANNOTATIONS)
     formats = ["%%-%ds  %%s\n" % (width + cextra(a)) for a in _ANNOTATIONS]
 
-    for f, a, l in zip(formats, _ANNOTATIONS, lines):
-        stream.write(f % (a, l))
+    for fmt, annotation, line in zip(formats, _ANNOTATIONS, lines):
+        stream.write(fmt % (annotation, line))
 
     if getvalue:
         return getvalue()
 
 
-def sorted_dict(dict_like):
-    """Return an ordered dict with all the fields sorted recursively.
-
-    Args:
-        dict_like (dict): dictionary to be sorted
-
-    Returns:
-        dictionary sorted recursively
-    """
-    result = syaml_dict(sorted(dict_like.items()))
-    for key, value in result.items():
-        if isinstance(value, collections.abc.Mapping):
-            result[key] = sorted_dict(value)
-    return result
+def sorted_dict(data):
+    """Descend into data and sort all dictionary keys."""
+    if isinstance(data, dict):
+        return type(data)((k, sorted_dict(v)) for k, v in sorted(data.items()))
+    elif isinstance(data, (list, tuple)):
+        return type(data)(sorted_dict(v) for v in data)
+    return data
 
 
 def extract_comments(data):
@@ -493,8 +520,54 @@ def name_mark(name):
     return error.StringMark(name, None, None, None, None, None)
 
 
+def anchorify(data: Union[dict, list], identifier: Callable[[Any], str] = repr) -> None:
+    """Replace identical dict/list branches in tree with references to earlier instances. The YAML
+    serializer generate anchors for them, resulting in small yaml files."""
+    anchors: Dict[str, Union[dict, list]] = {}
+    stack: List[Union[dict, list]] = [data]
+
+    while stack:
+        item = stack.pop()
+
+        for key, value in item.items() if isinstance(item, dict) else enumerate(item):
+            if not isinstance(value, (dict, list)):
+                continue
+
+            id = identifier(value)
+            anchor = anchors.get(id)
+
+            if anchor is None:
+                anchors[id] = value
+                stack.append(value)
+            else:
+                item[key] = anchor  # replace with reference
+
+
 class SpackYAMLError(spack.error.SpackError):
     """Raised when there are issues with YAML parsing."""
 
-    def __init__(self, msg, yaml_error):
+    def __init__(self, msg, yaml_error, filename=None):
+        self.filename = filename
         super().__init__(msg, str(yaml_error))
+
+
+def get_mark_from_yaml_data(obj):
+    """Try to get ``spack.util.spack_yaml`` mark from YAML data.
+
+    We try the object, and if that fails we try its first member (if it's a container).
+
+    Returns:
+        mark if one is found, otherwise None.
+    """
+    # mark of object itelf
+    mark = getattr(obj, "_start_mark", None)
+    if mark:
+        return mark
+
+    # mark of first member if it is a container
+    if isinstance(obj, (list, dict)):
+        first_member = next(iter(obj), None)
+        if first_member:
+            mark = getattr(first_member, "_start_mark", None)
+
+    return mark

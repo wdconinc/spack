@@ -1,5 +1,4 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
@@ -9,9 +8,8 @@ import pathlib
 import platform
 import subprocess
 
-from llnl.util import tty
-
 from spack.error import SpackError
+from spack.llnl.util import tty
 from spack.util import windows_registry as winreg
 from spack.version import Version
 
@@ -23,7 +21,7 @@ def windows_version():
     # include the build number as this provides important information
     # for low lever packages and components like the SDK and WDK
     # The build number is the version component that would otherwise
-    # be the patch version in sematic versioning, i.e. z of x.y.z
+    # be the patch version in semantic versioning, i.e. z of x.y.z
     return Version(platform.version())
 
 
@@ -74,16 +72,23 @@ class WindowsOs(OperatingSystem):
         return [os.path.join(path, "VC", "Tools", "MSVC") for path in self.vs_install_paths]
 
     @property
+    def oneapi_root(self):
+        root = os.environ.get("ONEAPI_ROOT", "") or os.path.join(
+            os.environ.get("ProgramFiles(x86)", ""), "Intel", "oneAPI"
+        )
+        if os.path.exists(root):
+            return root
+
+    @property
     def compiler_search_paths(self):
         # First Strategy: Find MSVC directories using vswhere
         _compiler_search_paths = []
         for p in self.msvc_paths:
             _compiler_search_paths.extend(glob.glob(os.path.join(p, "*", "bin", "Hostx64", "x64")))
-        if os.getenv("ONEAPI_ROOT"):
+        oneapi_root = self.oneapi_root
+        if oneapi_root:
             _compiler_search_paths.extend(
-                glob.glob(
-                    os.path.join(str(os.getenv("ONEAPI_ROOT")), "compiler", "*", "windows", "bin")
-                )
+                glob.glob(os.path.join(oneapi_root, "compiler", "**", "bin"), recursive=True)
             )
 
         # Second strategy: Find MSVC via the registry

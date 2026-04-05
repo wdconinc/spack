@@ -1,22 +1,21 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 """Test Spack's FileCache."""
 import os
+import pathlib
 
 import pytest
 
-import llnl.util.filesystem as fs
-
+import spack.llnl.util.filesystem as fs
 from spack.util.file_cache import CacheError, FileCache
 
 
 @pytest.fixture()
-def file_cache(tmpdir):
+def file_cache(tmp_path: pathlib.Path):
     """Returns a properly initialized FileCache instance"""
-    return FileCache(str(tmpdir))
+    return FileCache(str(tmp_path))
 
 
 def test_write_and_read_cache_file(file_cache):
@@ -29,6 +28,11 @@ def test_write_and_read_cache_file(file_cache):
     with file_cache.read_transaction("test.yaml") as stream:
         text = stream.read()
         assert text == "foobar\n"
+
+
+def test_read_before_init(file_cache):
+    with file_cache.read_transaction("test.yaml") as stream:
+        assert stream is None
 
 
 @pytest.mark.not_on_windows("Locks not supported on Windows")
@@ -45,11 +49,6 @@ def test_failed_write_and_read_cache_file(file_cache):
 
     # File does not exist
     assert not file_cache.init_entry("test.yaml")
-
-    # Attempting to read will cause a FileNotFoundError
-    with pytest.raises(FileNotFoundError, match=r"test\.yaml"):
-        with file_cache.read_transaction("test.yaml"):
-            pass
 
 
 def test_write_and_remove_cache_file(file_cache):
@@ -84,6 +83,7 @@ def test_write_and_remove_cache_file(file_cache):
 
 
 @pytest.mark.not_on_windows("Not supported on Windows (yet)")
+@pytest.mark.skipif(fs.getuid() == 0, reason="user is root")
 def test_cache_init_entry_fails(file_cache):
     """Test init_entry failures."""
     relpath = fs.join_path("test-dir", "read-only-file.txt")
@@ -107,6 +107,7 @@ def test_cache_init_entry_fails(file_cache):
         file_cache.init_entry(relpath)
 
 
+@pytest.mark.skipif(fs.getuid() == 0, reason="user is root")
 def test_cache_write_readonly_cache_fails(file_cache):
     """Test writing a read-only cached file."""
     filename = "read-only-file.txt"

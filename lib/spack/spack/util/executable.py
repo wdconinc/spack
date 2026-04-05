@@ -1,230 +1,314 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
+import io
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path, PurePath
+from typing import BinaryIO, Callable, Dict, List, Optional, Sequence, Tuple, Type, Union, overload
 
-import llnl.util.tty as tty
+from spack.vendor.typing_extensions import Literal
 
 import spack.error
+import spack.llnl.util.tty as tty
+from spack.util.environment import EnvironmentModifications
 
-__all__ = ["Executable", "which", "ProcessError"]
+__all__ = ["Executable", "which", "which_string", "ProcessError"]
+
+OutType = Union[Optional[BinaryIO], str, Type[str], Callable]
+
+
+def _process_cmd_output(
+    out: bytes,
+    err: bytes,
+    output: OutType,
+    error: OutType,
+    encoding: str = "ISO-8859-1" if sys.platform == "win32" else "utf-8",
+) -> Optional[str]:
+    if output is str or output is str.split or error is str or error is str.split:
+        result = ""
+        if output is str or output is str.split:
+            outstr = out.decode(encoding)
+            result += outstr
+            if output is str.split:
+                sys.stdout.write(outstr)
+        if error is str or error is str.split:
+            errstr = err.decode(encoding)
+            result += errstr
+            if error is str.split:
+                sys.stderr.write(errstr)
+        return result
+    else:
+        return None
+
+
+def _streamify_output(arg: OutType, name: str) -> Tuple[Union[int, BinaryIO, None], bool]:
+    if isinstance(arg, str):
+        return open(arg, "wb"), True
+    elif arg is str or arg is str.split:
+        return subprocess.PIPE, False
+    elif callable(arg):
+        raise ValueError(f"`{name}` must be a stream, a filename, or `str`/`str.split`")
+    else:
+        return arg, False
 
 
 class Executable:
-    """Class representing a program that can be run on the command line."""
+    """
+    Represent an executable file that can be run as a subprocess.
 
-    def __init__(self, name):
+    This class provides a simple interface for running executables with custom arguments and
+    environment variables. It supports setting default arguments and environment modifications,
+    copying instances, and running commands with various options for input/output/error handling.
+
+    Example usage:
+
+    .. code-block:: python
+
+        ls = Executable("ls")
+        ls.add_default_arg("-l")
+        ls.add_default_env("LC_ALL", "C")
+        output = ls("-a", output=str)  # Run 'ls -l -a' and capture output as string
+    """
+
+    def __init__(self, name: Union[str, Path]) -> None:
         file_path = str(Path(name))
-        if sys.platform != "win32" and name.startswith("."):
+        if sys.platform != "win32" and isinstance(name, str) and name.startswith("."):
             # pathlib strips the ./ from relative paths so it must be added back
             file_path = os.path.join(".", file_path)
+
         self.exe = [file_path]
+        self._default_env: Dict[str, str] = {}
+        self._default_envmod = EnvironmentModifications()
+        #: Return code of the last executed command.
+        self.returncode: int = 1  # 1 until proven successful
+        #: Whether to warn users that quotes are not needed, as Spack does not use a shell.
+        self.ignore_quotes: bool = False
 
-        self.default_env = {}
-        from spack.util.environment import EnvironmentModifications  # no cycle
-
-        self.default_envmod = EnvironmentModifications()
-        self.returncode = None
-
-        if not self.exe:
-            raise ProcessError("Cannot construct executable for '%s'" % name)
-
-    def add_default_arg(self, *args):
+    def add_default_arg(self, *args: str) -> None:
         """Add default argument(s) to the command."""
         self.exe.extend(args)
 
-    def add_default_env(self, key, value):
+    def with_default_args(self, *args: str) -> "Executable":
+        """Same as add_default_arg, but returns a copy of the executable."""
+        new = self.copy()
+        new.add_default_arg(*args)
+        return new
+
+    def copy(self) -> "Executable":
+        """Return a copy of this Executable."""
+        new = Executable(self.exe[0])
+        new.exe[:] = self.exe
+        new._default_env.update(self._default_env)
+        new._default_envmod.extend(self._default_envmod)
+        return new
+
+    def add_default_env(self, key: str, value: str) -> None:
         """Set an environment variable when the command is run.
 
         Parameters:
             key: The environment variable to set
             value: The value to set it to
         """
-        self.default_env[key] = value
+        self._default_env[key] = value
 
-    def add_default_envmod(self, envmod):
-        """Set an EnvironmentModifications to use when the command is run."""
-        self.default_envmod.extend(envmod)
+    def add_default_envmod(self, envmod: EnvironmentModifications) -> None:
+        """Set an :class:`spack.util.environment.EnvironmentModifications` to use when the command
+        is run."""
+        self._default_envmod.extend(envmod)
 
     @property
-    def command(self):
-        """The command-line string.
-
-        Returns:
-            str: The executable and default arguments
-        """
+    def command(self) -> str:
+        """Returns the entire command-line string"""
         return " ".join(self.exe)
 
     @property
-    def name(self):
-        """The executable name.
-
-        Returns:
-            str: The basename of the executable
-        """
+    def name(self) -> str:
+        """Returns the executable name"""
         return PurePath(self.path).name
 
     @property
-    def path(self):
-        """The path to the executable.
-
-        Returns:
-            str: The path to the executable
-        """
+    def path(self) -> str:
+        """Returns the executable path"""
         return str(PurePath(self.exe[0]))
 
-    def __call__(self, *args, **kwargs):
-        """Run this executable in a subprocess.
+    @overload
+    def __call__(
+        self,
+        *args: str,
+        fail_on_error: bool = ...,
+        ignore_errors: Union[int, Sequence[int]] = ...,
+        ignore_quotes: Optional[bool] = ...,
+        timeout: Optional[int] = ...,
+        env: Optional[Union[Dict[str, str], EnvironmentModifications]] = ...,
+        extra_env: Optional[Union[Dict[str, str], EnvironmentModifications]] = ...,
+        input: Optional[BinaryIO] = ...,
+        output: Union[Optional[BinaryIO], str] = ...,
+        error: Union[Optional[BinaryIO], str] = ...,
+        _dump_env: Optional[Dict[str, str]] = ...,
+    ) -> None: ...
+
+    @overload
+    def __call__(
+        self,
+        *args: str,
+        fail_on_error: bool = ...,
+        ignore_errors: Union[int, Sequence[int]] = ...,
+        ignore_quotes: Optional[bool] = ...,
+        timeout: Optional[int] = ...,
+        env: Optional[Union[Dict[str, str], EnvironmentModifications]] = ...,
+        extra_env: Optional[Union[Dict[str, str], EnvironmentModifications]] = ...,
+        input: Optional[BinaryIO] = ...,
+        output: Union[Type[str], Callable],  # str or str.split
+        error: OutType = ...,
+        _dump_env: Optional[Dict[str, str]] = ...,
+    ) -> str: ...
+
+    @overload
+    def __call__(
+        self,
+        *args: str,
+        fail_on_error: bool = ...,
+        ignore_errors: Union[int, Sequence[int]] = ...,
+        ignore_quotes: Optional[bool] = ...,
+        timeout: Optional[int] = ...,
+        env: Optional[Union[Dict[str, str], EnvironmentModifications]] = ...,
+        extra_env: Optional[Union[Dict[str, str], EnvironmentModifications]] = ...,
+        input: Optional[BinaryIO] = ...,
+        output: OutType = ...,
+        error: Union[Type[str], Callable],  # str or str.split
+        _dump_env: Optional[Dict[str, str]] = ...,
+    ) -> str: ...
+
+    def __call__(
+        self,
+        *args: str,
+        fail_on_error: bool = True,
+        ignore_errors: Union[int, Sequence[int]] = (),
+        ignore_quotes: Optional[bool] = None,
+        timeout: Optional[int] = None,
+        env: Optional[Union[Dict[str, str], EnvironmentModifications]] = None,
+        extra_env: Optional[Union[Dict[str, str], EnvironmentModifications]] = None,
+        input: Optional[BinaryIO] = None,
+        output: OutType = None,
+        error: OutType = None,
+        _dump_env: Optional[Dict[str, str]] = None,
+    ) -> Optional[str]:
+        """Runs this executable in a subprocess.
 
         Parameters:
-            *args (str): Command-line arguments to the executable to run
+            *args: command-line arguments to the executable to run
+            fail_on_error: if True, raises an exception if the subprocess returns an error
+                The return code is available as :attr:`returncode`
+            ignore_errors: a sequence of error codes to ignore. If these codes are returned, this
+                process will not raise an exception, even if ``fail_on_error`` is set to ``True``
+            ignore_quotes: if False, warn users that quotes are not needed, as Spack does not
+                use a shell. If None, use :attr:`ignore_quotes`.
+            timeout: the number of seconds to wait before killing the child process
+            env: the environment with which to run the executable
+            extra_env: extra items to add to the environment (neither requires nor precludes env)
+            input: where to read stdin from
+            output: where to send stdout
+            error: where to send stderr
+            _dump_env: dict to be set to the environment actually used (envisaged for
+                testing purposes only)
 
-        Keyword Arguments:
-            _dump_env (dict): Dict to be set to the environment actually
-                used (envisaged for testing purposes only)
-            env (dict or EnvironmentModifications): The environment with which
-                to run the executable
-            extra_env (dict or EnvironmentModifications): Extra items to add to
-                the environment (neither requires nor precludes env)
-            fail_on_error (bool): Raise an exception if the subprocess returns
-                an error. Default is True. The return code is available as
-                ``exe.returncode``
-            ignore_errors (int or list): A list of error codes to ignore.
-                If these codes are returned, this process will not raise
-                an exception even if ``fail_on_error`` is set to ``True``
-            ignore_quotes (bool): If False, warn users that quotes are not needed
-                as Spack does not use a shell. Defaults to False.
-            timeout (int or float): The number of seconds to wait before killing
-                the child process
-            input: Where to read stdin from
-            output: Where to send stdout
-            error: Where to send stderr
+        Accepted values for ``input``, ``output``, and ``error``:
 
-        Accepted values for input, output, and error:
-
-        * python streams, e.g. open Python file objects, or ``os.devnull``
-        * filenames, which will be automatically opened for writing
-        * ``str``, as in the Python string type. If you set these to ``str``,
+        * Python streams: open Python file objects or ``os.devnull``
+        * :obj:`str`: the Python string **type**. If you set these to :obj:`str`,
           output and error will be written to pipes and returned as a string.
-          If both ``output`` and ``error`` are set to ``str``, then one string
+          If both ``output`` and ``error`` are set to :obj:`str`, then one string
           is returned containing output concatenated with error. Not valid
-          for ``input``
-        * ``str.split``, as in the ``split`` method of the Python string type.
-          Behaves the same as ``str``, except that value is also written to
+          for ``input``.
+        * :obj:`str.split`: the split method of the Python string type.
+          Behaves the same as :obj:`str`, except that value is also written to
           ``stdout`` or ``stderr``.
 
+        For ``output`` and ``error`` it's also accepted to pass a string with a filename, which
+        will be automatically opened for writing.
+
         By default, the subprocess inherits the parent's file descriptors.
-
         """
-
-        def process_cmd_output(out, err):
-            result = None
-            if output in (str, str.split) or error in (str, str.split):
-                result = ""
-                if output in (str, str.split):
-                    if sys.platform == "win32":
-                        outstr = str(out.decode("ISO-8859-1"))
-                    else:
-                        outstr = str(out.decode("utf-8"))
-                    result += outstr
-                    if output is str.split:
-                        sys.stdout.write(outstr)
-                if error in (str, str.split):
-                    if sys.platform == "win32":
-                        errstr = str(err.decode("ISO-8859-1"))
-                    else:
-                        errstr = str(err.decode("utf-8"))
-                    result += errstr
-                    if error is str.split:
-                        sys.stderr.write(errstr)
-            return result
-
-        # Environment
-        env_arg = kwargs.get("env", None)
-
         # Setup default environment
-        env = os.environ.copy() if env_arg is None else {}
-        self.default_envmod.apply_modifications(env)
-        env.update(self.default_env)
-
-        from spack.util.environment import EnvironmentModifications  # no cycle
+        current_environment = os.environ.copy() if env is None else {}
+        self._default_envmod.apply_modifications(current_environment)
+        current_environment.update(self._default_env)
 
         # Apply env argument
-        if isinstance(env_arg, EnvironmentModifications):
-            env_arg.apply_modifications(env)
-        elif env_arg:
-            env.update(env_arg)
+        if isinstance(env, EnvironmentModifications):
+            env.apply_modifications(current_environment)
+        elif env:
+            current_environment.update(env)
 
         # Apply extra env
-        extra_env = kwargs.get("extra_env", {})
         if isinstance(extra_env, EnvironmentModifications):
-            extra_env.apply_modifications(env)
-        else:
-            env.update(extra_env)
+            extra_env.apply_modifications(current_environment)
+        elif extra_env is not None:
+            current_environment.update(extra_env)
 
-        if "_dump_env" in kwargs:
-            kwargs["_dump_env"].clear()
-            kwargs["_dump_env"].update(env)
+        if _dump_env is not None:
+            _dump_env.clear()
+            _dump_env.update(current_environment)
 
-        fail_on_error = kwargs.pop("fail_on_error", True)
-        ignore_errors = kwargs.pop("ignore_errors", ())
-        ignore_quotes = kwargs.pop("ignore_quotes", False)
-        timeout = kwargs.pop("timeout", None)
+        if ignore_quotes is None:
+            ignore_quotes = self.ignore_quotes
 
         # If they just want to ignore one error code, make it a tuple.
         if isinstance(ignore_errors, int):
             ignore_errors = (ignore_errors,)
 
-        input = kwargs.pop("input", None)
-        output = kwargs.pop("output", None)
-        error = kwargs.pop("error", None)
+        if input is str or input is str.split:
+            raise ValueError("Cannot use `str` or `str.split` as input stream.")
+        elif isinstance(input, str):
+            istream, close_istream = open(input, "rb"), True
+        else:
+            istream, close_istream = input, False
 
-        if input is str:
-            raise ValueError("Cannot use `str` as input stream.")
-
-        def streamify(arg, mode):
-            if isinstance(arg, str):
-                return open(arg, mode), True
-            elif arg in (str, str.split):
-                return subprocess.PIPE, False
-            else:
-                return arg, False
-
-        ostream, close_ostream = streamify(output, "w")
-        estream, close_estream = streamify(error, "w")
-        istream, close_istream = streamify(input, "r")
+        ostream, close_ostream = _streamify_output(output, "output")
+        estream, close_estream = _streamify_output(error, "error")
 
         if not ignore_quotes:
             quoted_args = [arg for arg in args if re.search(r'^".*"$|^\'.*\'$', arg)]
             if quoted_args:
                 tty.warn(
-                    "Quotes in command arguments can confuse scripts like" " configure.",
+                    "Quotes in command arguments can confuse scripts like configure.",
                     "The following arguments may cause problems when executed:",
                     str("\n".join(["    " + arg for arg in quoted_args])),
                     "Quotes aren't needed because spack doesn't use a shell. "
                     "Consider removing them.",
-                    "If multiple levels of quotation are required, use " "`ignore_quotes=True`.",
+                    "If multiple levels of quotation are required, use `ignore_quotes=True`.",
                 )
 
         cmd = self.exe + list(args)
 
-        escaped_cmd = ["'%s'" % arg.replace("'", "'\"'\"'") for arg in cmd]
-        cmd_line_string = " ".join(escaped_cmd)
+        cmd_line_string = " ".join(shlex.quote(arg) for arg in cmd)
         tty.debug(cmd_line_string)
 
+        result = None
         try:
             proc = subprocess.Popen(
-                cmd, stdin=istream, stderr=estream, stdout=ostream, env=env, close_fds=False
+                cmd,
+                stdin=istream,
+                stderr=estream,
+                stdout=ostream,
+                env=current_environment,
+                close_fds=False,
             )
-            out, err = proc.communicate(timeout=timeout)
+        except OSError as e:
+            message = "Command: " + cmd_line_string
+            if " " in self.exe[0]:
+                message += "\nDid you mean to add a space to the command?"
 
-            result = process_cmd_output(out, err)
+            raise ProcessError(f"{self.exe[0]}: {e.strerror}", message)
+
+        try:
+            out, err = proc.communicate(timeout=timeout)
+            result = _process_cmd_output(out, err, output, error)
             rc = self.returncode = proc.returncode
             if fail_on_error and rc != 0 and (rc not in ignore_errors):
                 long_msg = cmd_line_string
@@ -235,65 +319,63 @@ class Executable:
                     # stdout/stderr (e.g. if 'output' is not specified)
                     long_msg += "\n" + result
 
-                raise ProcessError("Command exited with status %d:" % proc.returncode, long_msg)
+                raise ProcessError(f"Command exited with status {proc.returncode}:", long_msg)
 
-            return result
-
-        except OSError as e:
-            message = "Command: " + cmd_line_string
-            if " " in self.exe[0]:
-                message += "\nDid you mean to add a space to the command?"
-
-            raise ProcessError("%s: %s" % (self.exe[0], e.strerror), message)
-
-        except subprocess.CalledProcessError as e:
-            if fail_on_error:
-                raise ProcessError(
-                    str(e),
-                    "\nExit status %d when invoking command: %s"
-                    % (proc.returncode, cmd_line_string),
-                )
         except subprocess.TimeoutExpired as te:
             proc.kill()
             out, err = proc.communicate()
-            result = process_cmd_output(out, err)
+            result = _process_cmd_output(out, err, output, error)
             long_msg = cmd_line_string + f"\n{result}"
             if fail_on_error:
                 raise ProcessTimeoutError(
-                    f"\nProcess timed out after {timeout}s"
-                    f"We expected the following command to run quickly but\
-it did not, please report this as an issue: {long_msg}",
+                    f"\nProcess timed out after {timeout}s. "
+                    "We expected the following command to run quickly but it did not, "
+                    f"please report this as an issue: {long_msg}",
                     long_message=long_msg,
                 ) from te
 
         finally:
-            if close_ostream:
+            # The isinstance checks are only needed for type checking.
+            if close_ostream and isinstance(ostream, io.IOBase):
                 ostream.close()
-            if close_estream:
+            if close_estream and isinstance(estream, io.IOBase):
                 estream.close()
-            if close_istream:
+            if close_istream and isinstance(istream, io.IOBase):
                 istream.close()
+
+        return result
 
     def __eq__(self, other):
         return hasattr(other, "exe") and self.exe == other.exe
-
-    def __neq__(self, other):
-        return not (self == other)
 
     def __hash__(self):
         return hash((type(self),) + tuple(self.exe))
 
     def __repr__(self):
-        return "<exe: %s>" % self.exe
+        return f"<exe: {self.exe}>"
 
     def __str__(self):
         return " ".join(self.exe)
 
 
-def which_string(*args, **kwargs):
-    """Like ``which()``, but return a string instead of an ``Executable``."""
-    path = kwargs.get("path", os.environ.get("PATH", ""))
-    required = kwargs.get("required", False)
+@overload
+def which_string(
+    *args: str, path: Optional[Union[List[str], str]] = ..., required: Literal[True]
+) -> str: ...
+
+
+@overload
+def which_string(
+    *args: str, path: Optional[Union[List[str], str]] = ..., required: bool = ...
+) -> Optional[str]: ...
+
+
+def which_string(
+    *args: str, path: Optional[Union[List[str], str]] = None, required: bool = False
+) -> Optional[str]:
+    """Like :func:`which`, but returns a string instead of an :class:`Executable`."""
+    if path is None:
+        path = os.environ.get("PATH", "")
 
     if isinstance(path, list):
         paths = [Path(str(x)) for x in path]
@@ -324,7 +406,6 @@ def which_string(*args, **kwargs):
             search_paths.insert(0, Path.cwd())
         search_paths = add_extra_search_paths(search_paths)
 
-        search_item = Path(search_item)
         candidate_items = get_candidate_items(Path(search_item))
 
         for candidate_item in candidate_items:
@@ -337,39 +418,50 @@ def which_string(*args, **kwargs):
                     pass
 
     if required:
-        raise CommandNotFoundError("spack requires '%s'. Make sure it is in your path." % args[0])
+        raise CommandNotFoundError(f"spack requires '{args[0]}'. Make sure it is in your path.")
 
     return None
 
 
-def which(*args, **kwargs):
+@overload
+def which(
+    *args: str, path: Optional[Union[List[str], str]] = ..., required: Literal[True]
+) -> Executable: ...
+
+
+@overload
+def which(
+    *args: str, path: Optional[Union[List[str], str]] = ..., required: bool = ...
+) -> Optional[Executable]: ...
+
+
+def which(
+    *args: str, path: Optional[Union[List[str], str]] = None, required: bool = False
+) -> Optional[Executable]:
     """Finds an executable in the path like command-line which.
 
     If given multiple executables, returns the first one that is found.
     If no executables are found, returns None.
 
     Parameters:
-        *args (str): One or more executables to search for
-
-    Keyword Arguments:
-        path (list or str): The path to search. Defaults to ``PATH``
-        required (bool): If set to True, raise an error if executable not found
+        *args: one or more executables to search for
+        path: the path to search. Defaults to ``PATH``
+        required: if set to :data:`True`, raise an error if executable not found
 
     Returns:
-        Executable: The first executable that is found in the path
+        The first executable that is found in the path or :data:`None` if not found.
     """
-    exe = which_string(*args, **kwargs)
-    return Executable(exe) if exe else None
+    exe = which_string(*args, path=path, required=required)
+    return Executable(exe) if exe is not None else None
 
 
 class ProcessError(spack.error.SpackError):
-    """ProcessErrors are raised when Executables exit with an error code."""
+    """Raised when :class:`Executable` exits with an error code."""
 
 
 class ProcessTimeoutError(ProcessError):
-    """ProcessTimeoutErrors are raised when Executable calls with a
-    specified timeout exceed that time"""
+    """Raised when :class:`Executable` calls with a specified timeout exceed that time."""
 
 
 class CommandNotFoundError(spack.error.SpackError):
-    """Raised when ``which()`` can't find a required executable."""
+    """Raised when :func:`which()` can't find a required executable."""

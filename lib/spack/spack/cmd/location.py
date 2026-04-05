@@ -1,27 +1,25 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
+import argparse
 import os
-
-import llnl.util.tty as tty
 
 import spack.builder
 import spack.cmd
 import spack.environment as ev
+import spack.llnl.util.tty as tty
 import spack.paths
 import spack.repo
 import spack.stage
 from spack.cmd.common import arguments
 
 description = "print out locations of packages and spack directories"
-section = "basic"
+section = "query"
 level = "long"
 
 
-def setup_parser(subparser):
-    global directories
+def setup_parser(subparser: argparse.ArgumentParser) -> None:
     directories = subparser.add_mutually_exclusive_group()
 
     directories.add_argument(
@@ -44,7 +42,14 @@ def setup_parser(subparser):
         help="directory enclosing a spec's package.py file",
     )
     directories.add_argument(
-        "-P", "--packages", action="store_true", help="top-level packages directory for Spack"
+        "--repo",
+        # for backwards compatibility
+        "--packages",
+        "-P",
+        nargs="?",
+        default=False,
+        metavar="repo",
+        help="package repository root (defaults to first configured repository)",
     )
     directories.add_argument(
         "-s", "--stage-dir", action="store_true", help="stage directory for a spec"
@@ -109,8 +114,14 @@ def location(parser, args):
         print(path)
         return
 
-    if args.packages:
-        print(spack.repo.PATH.first_repo().root)
+    if args.repo is not False:
+        if args.repo is None:
+            print(spack.repo.PATH.first_repo().root)
+            return
+        try:
+            print(spack.repo.PATH.get_repo(args.repo).root)
+        except spack.repo.UnknownNamespaceError:
+            tty.die(f"no such repository: '{args.repo}'")
         return
 
     if args.stages:

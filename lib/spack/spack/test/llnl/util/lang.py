@@ -1,18 +1,24 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
-import os.path
+import os
+import pathlib
 import re
 import sys
 from datetime import datetime, timedelta
-from textwrap import dedent
 
 import pytest
 
-import llnl.util.lang
-from llnl.util.lang import dedupe, match_predicate, memoized, pretty_date, stable_args
+import spack.llnl.util.lang
+from spack.llnl.util.lang import (
+    Singleton,
+    SingletonInstantiationError,
+    dedupe,
+    match_predicate,
+    memoized,
+    pretty_date,
+)
 
 
 @pytest.fixture()
@@ -21,15 +27,15 @@ def now():
 
 
 @pytest.fixture()
-def module_path(tmpdir):
-    m = tmpdir.join("foo.py")
+def module_path(tmp_path: pathlib.Path):
+    m = tmp_path / "foo.py"
     content = """
-import os.path
+import os
 
 value = 1
 path = os.path.join('/usr', 'bin')
 """
-    m.write(content)
+    m.write_text(content)
 
     yield str(m)
 
@@ -99,7 +105,7 @@ def test_pretty_date():
 )
 def test_pretty_string_to_date_delta(now, delta, pretty_string):
     t1 = now - delta
-    t2 = llnl.util.lang.pretty_string_to_date(pretty_string, now)
+    t2 = spack.llnl.util.lang.pretty_string_to_date(pretty_string, now)
     assert t1 == t2
 
 
@@ -115,16 +121,25 @@ def test_pretty_string_to_date_delta(now, delta, pretty_string):
 )
 def test_pretty_string_to_date(format, pretty_string):
     t1 = datetime.strptime(pretty_string, format)
-    t2 = llnl.util.lang.pretty_string_to_date(pretty_string, now)
+    t2 = spack.llnl.util.lang.pretty_string_to_date(pretty_string, now)
     assert t1 == t2
 
 
 def test_pretty_seconds():
-    assert llnl.util.lang.pretty_seconds(2.1) == "2.100s"
-    assert llnl.util.lang.pretty_seconds(2.1 / 1000) == "2.100ms"
-    assert llnl.util.lang.pretty_seconds(2.1 / 1000 / 1000) == "2.100us"
-    assert llnl.util.lang.pretty_seconds(2.1 / 1000 / 1000 / 1000) == "2.100ns"
-    assert llnl.util.lang.pretty_seconds(2.1 / 1000 / 1000 / 1000 / 10) == "0.210ns"
+    assert spack.llnl.util.lang.pretty_seconds(2.1) == "2.100s"
+    assert spack.llnl.util.lang.pretty_seconds(2.1 / 1000) == "2.100ms"
+    assert spack.llnl.util.lang.pretty_seconds(2.1 / 1000 / 1000) == "2.100us"
+    assert spack.llnl.util.lang.pretty_seconds(2.1 / 1000 / 1000 / 1000) == "2.100ns"
+    assert spack.llnl.util.lang.pretty_seconds(2.1 / 1000 / 1000 / 1000 / 10) == "0.210ns"
+
+
+def test_pretty_duration():
+    assert spack.llnl.util.lang.pretty_duration(0) == "0s"
+    assert spack.llnl.util.lang.pretty_duration(45) == "45s"
+    assert spack.llnl.util.lang.pretty_duration(60) == "1m00s"
+    assert spack.llnl.util.lang.pretty_duration(125) == "2m05s"
+    assert spack.llnl.util.lang.pretty_duration(3600) == "1h00m"
+    assert spack.llnl.util.lang.pretty_duration(3661) == "1h01m"
 
 
 def test_match_predicate():
@@ -153,24 +168,24 @@ def test_load_modules_from_file(module_path):
     assert "foo" not in sys.modules
 
     # Check that the module is loaded correctly from file
-    foo = llnl.util.lang.load_module_from_file("foo", module_path)
+    foo = spack.llnl.util.lang.load_module_from_file("foo", module_path)
     assert "foo" in sys.modules
     assert foo.value == 1
     assert foo.path == os.path.join("/usr", "bin")
 
     # Check that the module is not reloaded a second time on subsequent calls
     foo.value = 2
-    foo = llnl.util.lang.load_module_from_file("foo", module_path)
+    foo = spack.llnl.util.lang.load_module_from_file("foo", module_path)
     assert "foo" in sys.modules
     assert foo.value == 2
     assert foo.path == os.path.join("/usr", "bin")
 
 
 def test_uniq():
-    assert [1, 2, 3] == llnl.util.lang.uniq([1, 2, 3])
-    assert [1, 2, 3] == llnl.util.lang.uniq([1, 1, 1, 1, 2, 2, 2, 3, 3])
-    assert [1, 2, 1] == llnl.util.lang.uniq([1, 1, 1, 1, 2, 2, 2, 1, 1])
-    assert [] == llnl.util.lang.uniq([])
+    assert [1, 2, 3] == spack.llnl.util.lang.uniq([1, 2, 3])
+    assert [1, 2, 3] == spack.llnl.util.lang.uniq([1, 1, 1, 1, 2, 2, 2, 3, 3])
+    assert [1, 2, 1] == spack.llnl.util.lang.uniq([1, 1, 1, 1, 2, 2, 2, 1, 1])
+    assert [] == spack.llnl.util.lang.uniq([])
 
 
 def test_key_ordering():
@@ -178,12 +193,12 @@ def test_key_ordering():
 
     with pytest.raises(TypeError):
 
-        @llnl.util.lang.key_ordering
+        @spack.llnl.util.lang.key_ordering
         class ClassThatHasNoCmpKeyMethod:
             # this will raise b/c it does not define _cmp_key
             pass
 
-    @llnl.util.lang.key_ordering
+    @spack.llnl.util.lang.key_ordering
     class KeyComparable:
         def __init__(self, t):
             self.t = t
@@ -224,28 +239,6 @@ def test_key_ordering():
     assert hash(b) == hash(b2)
 
 
-@pytest.mark.parametrize(
-    "args1,kwargs1,args2,kwargs2",
-    [
-        # Ensure tuples passed in args are disambiguated from equivalent kwarg items.
-        (("a", 3), {}, (), {"a": 3})
-    ],
-)
-def test_unequal_args(args1, kwargs1, args2, kwargs2):
-    assert stable_args(*args1, **kwargs1) != stable_args(*args2, **kwargs2)
-
-
-@pytest.mark.parametrize(
-    "args1,kwargs1,args2,kwargs2",
-    [
-        # Ensure that kwargs are stably sorted.
-        ((), {"a": 3, "b": 4}, (), {"b": 4, "a": 3})
-    ],
-)
-def test_equal_args(args1, kwargs1, args2, kwargs2):
-    assert stable_args(*args1, **kwargs1) == stable_args(*args2, **kwargs2)
-
-
 @pytest.mark.parametrize("args, kwargs", [((1,), {}), ((), {"a": 3}), ((1,), {"a": 3})])
 def test_memoized(args, kwargs):
     @memoized
@@ -253,9 +246,8 @@ def test_memoized(args, kwargs):
         return "return-value"
 
     assert f(*args, **kwargs) == "return-value"
-    key = stable_args(*args, **kwargs)
-    assert list(f.cache.keys()) == [key]
-    assert f.cache[key] == "return-value"
+    assert f(*args, **kwargs) == "return-value"
+    assert f.cache_info().hits == 1
 
 
 @pytest.mark.parametrize("args, kwargs", [(([1],), {}), ((), {"a": [1]})])
@@ -266,12 +258,8 @@ def test_memoized_unhashable(args, kwargs):
     def f(*args, **kwargs):
         return None
 
-    with pytest.raises(llnl.util.lang.UnhashableArguments) as exc_info:
+    with pytest.raises(TypeError, match="unhashable type:"):
         f(*args, **kwargs)
-    exc_msg = str(exc_info.value)
-    key = stable_args(*args, **kwargs)
-    assert str(key) in exc_msg
-    assert "function 'f'" in exc_msg
 
 
 def test_dedupe():
@@ -280,7 +268,7 @@ def test_dedupe():
 
 
 def test_grouped_exception():
-    h = llnl.util.lang.GroupedExceptionHandler()
+    h = spack.llnl.util.lang.GroupedExceptionHandler()
 
     def inner():
         raise ValueError("wow!")
@@ -291,40 +279,9 @@ def test_grouped_exception():
     with h.forward("top-level"):
         raise TypeError("ok")
 
-    assert h.grouped_message(with_tracebacks=False) == dedent(
-        """\
-    due to the following failures:
-    inner method raised ValueError: wow!
-    top-level raised TypeError: ok"""
-    )
-
-    full_message = h.grouped_message(with_tracebacks=True)
-    no_line_numbers = re.sub(r"line [0-9]+,", "line xxx,", full_message)
-
-    assert (
-        no_line_numbers
-        == dedent(
-            """\
-    due to the following failures:
-    inner method raised ValueError: wow!
-      File "{0}", \
-line xxx, in test_grouped_exception
-        inner()
-      File "{0}", \
-line xxx, in inner
-        raise ValueError("wow!")
-
-    top-level raised TypeError: ok
-      File "{0}", \
-line xxx, in test_grouped_exception
-        raise TypeError("ok")
-    """
-        ).format(__file__)
-    )
-
 
 def test_grouped_exception_base_type():
-    h = llnl.util.lang.GroupedExceptionHandler()
+    h = spack.llnl.util.lang.GroupedExceptionHandler()
 
     with h.forward("catch-runtime-error", RuntimeError):
         raise NotImplementedError()
@@ -336,3 +293,120 @@ def test_grouped_exception_base_type():
     message = h.grouped_message(with_tracebacks=False)
     assert "catch-runtime-error" in message
     assert "catch-value-error" not in message
+
+
+def test_class_level_constant_value():
+    """Tests that the Const descriptor does not allow overwriting the value from an instance"""
+
+    class _SomeClass:
+        CONST_VALUE = spack.llnl.util.lang.Const(10)
+
+    with pytest.raises(TypeError, match="not support assignment"):
+        _SomeClass().CONST_VALUE = 11
+
+
+def test_deprecated_property():
+    """Tests the behavior of the DeprecatedProperty descriptor, which is can be used when
+    deprecating an attribute.
+    """
+
+    class _Deprecated(spack.llnl.util.lang.DeprecatedProperty):
+        def factory(self, instance, owner):
+            return 46
+
+    class _SomeClass:
+        deprecated = _Deprecated("deprecated")
+
+    # Default behavior is to just return the deprecated value
+    s = _SomeClass()
+    assert s.deprecated == 46
+
+    # When setting error_level to 1 the attribute warns
+    _SomeClass.deprecated.error_lvl = 1
+    with pytest.warns(UserWarning):
+        assert s.deprecated == 46
+
+    # When setting error_level to 2 an exception is raised
+    _SomeClass.deprecated.error_lvl = 2
+    with pytest.raises(AttributeError):
+        _ = s.deprecated
+
+
+def test_fnmatch_multiple():
+    named_patterns = {"a": "libf*o.so", "b": "libb*r.so"}
+    regex = re.compile(spack.llnl.util.lang.fnmatch_translate_multiple(named_patterns))
+
+    a = regex.match("libfoo.so")
+    assert a and a.group("a") == "libfoo.so"
+
+    b = regex.match("libbar.so")
+    assert b and b.group("b") == "libbar.so"
+
+    assert not regex.match("libfoo.so.1")
+    assert not regex.match("libbar.so.1")
+    assert not regex.match("libfoo.solibbar.so")
+    assert not regex.match("libbaz.so")
+
+
+def _attr_error_factory():
+    raise AttributeError("Could not make something")
+
+
+def test_singleton_instantiation_attr_failure():
+    """
+    If an AttributeError occurs during the instantiation of a Singleton
+    object, we want to see that error.
+    """
+    x = Singleton(_attr_error_factory)
+    with pytest.raises(SingletonInstantiationError) as last_exception:
+        x.something
+
+    def follow_exceptions(e):
+        while e:
+            yield e
+            e = e.__cause__ or e.__context__
+
+    assert any(
+        "Could not make something" in str(e) for e in follow_exceptions(last_exception.value)
+    )
+
+
+class TestPriorityOrderedMapping:
+    @pytest.mark.parametrize(
+        "elements,expected",
+        [
+            # Push out-of-order with explicit, and different, priorities
+            ([("b", 2), ("a", 1), ("d", 4), ("c", 3)], ["a", "b", "c", "d"]),
+            # Push in-order with priority=None
+            ([("a", None), ("b", None), ("c", None), ("d", None)], ["a", "b", "c", "d"]),
+            # Mix explicit and implicit priorities
+            ([("b", 2), ("c", None), ("a", 1), ("d", None)], ["a", "b", "c", "d"]),
+            ([("b", 10), ("c", None), ("a", -20), ("d", None)], ["a", "b", "c", "d"]),
+            ([("b", 10), ("c", None), ("a", 20), ("d", None)], ["b", "c", "a", "d"]),
+            # Adding the same key twice with different priorities
+            ([("b", 10), ("c", None), ("a", 20), ("d", None), ("a", -20)], ["a", "b", "c", "d"]),
+            # Adding the same key twice, no priorities
+            ([("b", None), ("a", None), ("b", None)], ["a", "b"]),
+        ],
+    )
+    def test_iteration_order(self, elements, expected):
+        """Tests that the iteration order respects priorities, no matter the insertion order."""
+        m = spack.llnl.util.lang.PriorityOrderedMapping()
+        for key, priority in elements:
+            m.add(key, value=None, priority=priority)
+        assert list(m) == expected
+
+    def test_reverse_iteration(self):
+        """Tests that we can conveniently use reverse iteration"""
+        m = spack.llnl.util.lang.PriorityOrderedMapping()
+        for key, value in [("a", 1), ("b", 2), ("c", 3)]:
+            m.add(key, value=value)
+
+        assert list(m) == ["a", "b", "c"]
+        assert list(reversed(m)) == ["c", "b", "a"]
+
+        assert list(m.keys()) == ["a", "b", "c"]
+        assert list(m.reversed_keys()) == ["c", "b", "a"]
+
+        assert list(m.values()) == [1, 2, 3]
+        assert list(m.reversed_values()) == [3, 2, 1]

@@ -1,21 +1,21 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 import argparse
 import os
+import pathlib
 
 import pytest
 
-from llnl.util.filesystem import copy_tree
-
-import spack.cmd.install
+import spack.cmd.common.arguments
+import spack.cmd.test
+import spack.concretize
 import spack.config
-import spack.package_base
+import spack.install_test
 import spack.paths
-import spack.store
 from spack.install_test import TestStatus
+from spack.llnl.util.filesystem import copy_tree, working_dir
 from spack.main import SpackCommand
 
 install = SpackCommand("install")
@@ -25,13 +25,7 @@ pytestmark = pytest.mark.not_on_windows("does not run on windows")
 
 
 def test_test_package_not_installed(
-    tmpdir,
-    mock_packages,
-    mock_archive,
-    mock_fetch,
-    config,
-    install_mockery_mutable_config,
-    mock_test_stage,
+    mock_packages, mock_archive, mock_fetch, install_mockery, mock_test_stage
 ):
     output = spack_test("run", "libdwarf")
 
@@ -53,25 +47,20 @@ def test_test_dirty_flag(arguments, expected):
     assert args.dirty == expected
 
 
-def test_test_dup_alias(
-    mock_test_stage, mock_packages, mock_archive, mock_fetch, install_mockery_mutable_config, capfd
-):
+def test_test_dup_alias(mock_test_stage, mock_packages, mock_archive, mock_fetch, install_mockery):
     """Ensure re-using an alias fails with suggestion to change."""
-    install("libdwarf")
+    install("--fake", "libdwarf")
 
     # Run the (no) tests with the alias once
     spack_test("run", "--alias", "libdwarf", "libdwarf")
 
     # Try again with the alias but don't let it fail on the error
-    with capfd.disabled():
-        out = spack_test("run", "--alias", "libdwarf", "libdwarf", fail_on_error=False)
+    out = spack_test("run", "--alias", "libdwarf", "libdwarf", fail_on_error=False)
 
     assert "already exists" in out and "Try another alias" in out
 
 
-def test_test_output(
-    mock_test_stage, mock_packages, mock_archive, mock_fetch, install_mockery_mutable_config
-):
+def test_test_output(mock_test_stage, mock_packages, mock_archive, mock_fetch, install_mockery):
     """Ensure output printed from pkgs is captured by output redirection."""
     install("printing-package")
     spack_test("run", "--alias", "printpkg", "printing-package")
@@ -87,7 +76,7 @@ def test_test_output(
 
     # Grab the output from the test log to confirm expected result
     outfile = os.path.join(testdir, testlogs[0])
-    with open(outfile, "r") as f:
+    with open(outfile, "r", encoding="utf-8") as f:
         output = f.read()
     assert "test_print" in output
     assert "PASSED" in output
@@ -97,13 +86,7 @@ def test_test_output(
     "pkg_name,failure", [("test-error", "exited with status 1"), ("test-fail", "not callable")]
 )
 def test_test_output_fails(
-    mock_packages,
-    mock_archive,
-    mock_fetch,
-    install_mockery_mutable_config,
-    mock_test_stage,
-    pkg_name,
-    failure,
+    mock_packages, mock_archive, mock_fetch, install_mockery, mock_test_stage, pkg_name, failure
 ):
     """Confirm stand-alone test failure with expected outputs."""
     install(pkg_name)
@@ -117,9 +100,7 @@ def test_test_output_fails(
     assert "See test log for details" in out
 
 
-@pytest.mark.usefixtures(
-    "mock_packages", "mock_archive", "mock_fetch", "install_mockery_mutable_config"
-)
+@pytest.mark.usefixtures("mock_packages", "mock_archive", "mock_fetch", "install_mockery")
 @pytest.mark.parametrize(
     "pkg_name,msgs",
     [
@@ -127,19 +108,19 @@ def test_test_output_fails(
         ("test-fail", ["not callable", "TestFailure"]),
     ],
 )
-def test_junit_output_with_failures(tmpdir, mock_test_stage, pkg_name, msgs):
+def test_junit_output_with_failures(tmp_path: pathlib.Path, mock_test_stage, pkg_name, msgs):
     """Confirm stand-alone test failure expected outputs in JUnit reporting."""
     install(pkg_name)
-    with tmpdir.as_cwd():
+    with working_dir(str(tmp_path)):
         spack_test(
             "run", "--log-format=junit", "--log-file=test.xml", pkg_name, fail_on_error=False
         )
 
-    files = tmpdir.listdir()
-    filename = tmpdir.join("test.xml")
+    files = list(tmp_path.iterdir())
+    filename = tmp_path / "test.xml"
     assert filename in files
 
-    content = filename.open().read()
+    content = filename.read_text()
 
     # Count failures and errors correctly
     assert 'tests="1"' in content
@@ -153,17 +134,16 @@ def test_junit_output_with_failures(tmpdir, mock_test_stage, pkg_name, msgs):
 
 
 def test_cdash_output_test_error(
-    tmpdir,
+    tmp_path: pathlib.Path,
     mock_fetch,
-    install_mockery_mutable_config,
+    install_mockery,
     mock_packages,
     mock_archive,
     mock_test_stage,
-    capfd,
 ):
     """Confirm stand-alone test error expected outputs in CDash reporting."""
     install("test-error")
-    with tmpdir.as_cwd():
+    with working_dir(str(tmp_path)):
         spack_test(
             "run",
             "--log-format=cdash",
@@ -171,28 +151,28 @@ def test_cdash_output_test_error(
             "test-error",
             fail_on_error=False,
         )
-        report_dir = tmpdir.join("cdash_reports")
-        reports = [name for name in report_dir.listdir() if str(name).endswith("Testing.xml")]
+        report_dir = tmp_path / "cdash_reports"
+        reports = [name for name in report_dir.iterdir() if str(name).endswith("Testing.xml")]
         assert len(reports) == 1
-        content = reports[0].open().read()
+        content = reports[0].read_text()
         assert "Command exited with status 1" in content
 
 
 def test_cdash_upload_clean_test(
-    tmpdir,
+    tmp_path: pathlib.Path,
     mock_fetch,
-    install_mockery_mutable_config,
+    install_mockery,
     mock_packages,
     mock_archive,
     mock_test_stage,
 ):
     install("printing-package")
-    with tmpdir.as_cwd():
+    with working_dir(str(tmp_path)):
         spack_test("run", "--log-file=cdash_reports", "--log-format=cdash", "printing-package")
-        report_dir = tmpdir.join("cdash_reports")
-        reports = [name for name in report_dir.listdir() if str(name).endswith("Testing.xml")]
+        report_dir = tmp_path / "cdash_reports"
+        reports = [name for name in report_dir.iterdir() if str(name).endswith("Testing.xml")]
         assert len(reports) == 1
-        content = reports[0].open().read()
+        content = reports[0].read_text()
         assert "passed" in content
         assert "Running test_print" in content, "Expected first command output"
         assert "second command" in content, "Expected second command output"
@@ -200,12 +180,10 @@ def test_cdash_upload_clean_test(
         assert "<Text>" not in content
 
 
-def test_test_help_does_not_show_cdash_options(mock_test_stage, capsys):
+def test_test_help_does_not_show_cdash_options(mock_test_stage):
     """Make sure `spack test --help` does not describe CDash arguments"""
-    with pytest.raises(SystemExit):
-        spack_test("run", "--help")
-        captured = capsys.readouterr()
-        assert "CDash URL" not in captured.out
+    spack_test("run", "--help")
+    assert "CDash URL" not in spack_test.output
 
 
 def test_test_help_cdash(mock_test_stage):
@@ -217,23 +195,24 @@ def test_test_help_cdash(mock_test_stage):
 def test_test_list_all(mock_packages):
     """Confirm `spack test list --all` returns all packages with test methods"""
     pkgs = spack_test("list", "--all").strip().split()
-    assert set(pkgs) == set(
-        [
-            "fail-test-audit",
-            "mpich",
-            "perl-extension",
-            "printing-package",
-            "py-extension1",
-            "py-extension2",
-            "py-test-callback",
-            "simple-standalone-test",
-            "test-error",
-            "test-fail",
-        ]
-    )
+    assert set(pkgs) == {
+        "py-numpy",
+        "fail-test-audit",
+        "fail-test-audit-docstring",
+        "fail-test-audit-impl",
+        "mpich",
+        "perl-extension",
+        "printing-package",
+        "py-extension1",
+        "py-extension2",
+        "py-test-callback",
+        "simple-standalone-test",
+        "test-error",
+        "test-fail",
+    }
 
 
-def test_test_list(mock_packages, mock_archive, mock_fetch, install_mockery_mutable_config):
+def test_test_list(mock_packages, mock_archive, mock_fetch, install_mockery):
     pkg_with_tests = "printing-package"
     install(pkg_with_tests)
     output = spack_test("list")
@@ -264,7 +243,7 @@ def test_read_old_results(mock_packages, mock_test_stage):
 
 def test_test_results_none(mock_packages, mock_test_stage):
     name = "trivial"
-    spec = spack.spec.Spec("trivial-smoke-test").concretized()
+    spec = spack.concretize.concretize_one("trivial-smoke-test")
     suite = spack.install_test.TestSuite([spec], name)
     suite.ensure_stage()
     spack.install_test.write_test_suite_file(suite)
@@ -279,7 +258,7 @@ def test_test_results_none(mock_packages, mock_test_stage):
 def test_test_results_status(mock_packages, mock_test_stage, status):
     """Confirm 'spack test results' returns expected status."""
     name = "trivial"
-    spec = spack.spec.Spec("trivial-smoke-test").concretized()
+    spec = spack.concretize.concretize_one("trivial-smoke-test")
     suite = spack.install_test.TestSuite([spec], name)
     suite.ensure_stage()
     spack.install_test.write_test_suite_file(suite)
@@ -299,10 +278,10 @@ def test_test_results_status(mock_packages, mock_test_stage, status):
 
 
 @pytest.mark.regression("35337")
-def test_report_filename_for_cdash(install_mockery_mutable_config, mock_fetch):
+def test_report_filename_for_cdash(install_mockery, mock_fetch):
     """Test that the temporary file used to write Testing.xml for CDash is not the upload URL"""
     name = "trivial"
-    spec = spack.spec.Spec("trivial-smoke-test").concretized()
+    spec = spack.concretize.concretize_one("trivial-smoke-test")
     suite = spack.install_test.TestSuite([spec], name)
     suite.ensure_stage()
 
@@ -322,7 +301,7 @@ def test_report_filename_for_cdash(install_mockery_mutable_config, mock_fetch):
 
 
 def test_test_output_multiple_specs(
-    mock_test_stage, mock_packages, mock_archive, mock_fetch, install_mockery_mutable_config
+    mock_test_stage, mock_packages, mock_archive, mock_fetch, install_mockery
 ):
     """Ensure proper reporting for suite with skipped, failing, and passed tests."""
     install("test-error", "simple-standalone-test@0.9", "simple-standalone-test@1.0")

@@ -1,11 +1,9 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 """Service functions and classes to implement the hooks
 for Spack's command extensions.
 """
-import difflib
 import glob
 import importlib
 import os
@@ -15,18 +13,14 @@ import types
 from pathlib import Path
 from typing import List
 
-import llnl.util.lang
-
 import spack.config
 import spack.error
+import spack.llnl.util.lang
 import spack.util.path
 
 _extension_regexp = re.compile(r"spack-(\w[-\w]*)$")
 
 
-# TODO: For consistency we should use spack.cmd.python_name(), but
-#       currently this would create a circular relationship between
-#       spack.cmd and spack.extensions.
 def _python_name(cmd_name):
     return cmd_name.replace("-", "_")
 
@@ -95,7 +89,7 @@ def ensure_extension_loaded(extension, *, path):
         parts = [path] + name.split(".") + ["__init__.py"]
         init_file = os.path.join(*parts)
         if os.path.exists(init_file):
-            m = llnl.util.lang.load_module_from_file(package_name, init_file)
+            m = spack.llnl.util.lang.load_module_from_file(package_name, init_file)
         else:
             m = types.ModuleType(package_name)
 
@@ -114,7 +108,7 @@ def ensure_extension_loaded(extension, *, path):
 
 
 def load_extension(name: str) -> str:
-    """Loads a single extension into the 'spack.extensions' package.
+    """Loads a single extension into the ``spack.extensions`` package.
 
     Args:
         name: name of the extension
@@ -138,6 +132,7 @@ def get_extension_paths():
     return paths
 
 
+@spack.llnl.util.lang.memoized
 def extension_paths_from_entry_points() -> List[str]:
     """Load extensions from a Python package's entry points.
 
@@ -152,9 +147,11 @@ def extension_paths_from_entry_points() -> List[str]:
     The function ``get_spack_extensions`` returns paths to the package's
     spack extensions
 
+    This function assumes that the state of entry points doesn't change from the first time it's
+    called. E.g., it doesn't support any new installation of packages between two calls.
     """
     extension_paths: List[str] = []
-    for entry_point in llnl.util.lang.get_entry_points(group="spack.extensions"):
+    for entry_point in spack.llnl.util.lang.get_entry_points(group="spack.extensions"):
         hook = entry_point.load()
         if callable(hook):
             paths = hook() or []
@@ -192,7 +189,7 @@ def path_for_extension(target_name: str, *, paths: List[str]) -> str:
         if name == target_name:
             return path
     else:
-        raise IOError('extension "{0}" not found'.format(target_name))
+        raise OSError('extension "{0}" not found'.format(target_name))
 
 
 def get_module(cmd_name):
@@ -210,8 +207,7 @@ def get_module(cmd_name):
         module = load_command_extension(cmd_name, folder)
         if module:
             return module
-    else:
-        raise CommandNotFoundError(cmd_name)
+    return None
 
 
 def get_template_dirs():
@@ -221,27 +217,6 @@ def get_template_dirs():
     extension_dirs = get_extension_paths()
     extensions = [os.path.join(x, "templates") for x in extension_dirs]
     return extensions
-
-
-class CommandNotFoundError(spack.error.SpackError):
-    """Exception class thrown when a requested command is not recognized as
-    such.
-    """
-
-    def __init__(self, cmd_name):
-        msg = (
-            "{0} is not a recognized Spack command or extension command;"
-            " check with `spack commands`.".format(cmd_name)
-        )
-        long_msg = None
-
-        similar = difflib.get_close_matches(cmd_name, spack.cmd.all_commands())
-
-        if 1 <= len(similar) <= 5:
-            long_msg = "\nDid you mean one of the following commands?\n  "
-            long_msg += "\n  ".join(similar)
-
-        super().__init__(msg, long_msg)
 
 
 class ExtensionNamingError(spack.error.SpackError):

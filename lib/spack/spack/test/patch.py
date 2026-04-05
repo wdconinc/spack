@@ -1,23 +1,27 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 import collections
 import filecmp
 import os
+import pathlib
 import shutil
 import sys
 
 import pytest
 
-from llnl.util.filesystem import mkdirp, touch, working_dir
-
+import spack.concretize
+import spack.deptypes as dt
+import spack.error
+import spack.fetch_strategy
 import spack.patch
 import spack.paths
 import spack.repo
-import spack.util.compression
+import spack.spec
+import spack.stage
 import spack.util.url as url_util
+from spack.llnl.util.filesystem import mkdirp, touch, working_dir
 from spack.spec import Spec
 from spack.stage import Stage
 from spack.util.executable import Executable
@@ -62,9 +66,9 @@ platform_url_sha = (
 
 
 @pytest.fixture()
-def mock_patch_stage(tmpdir_factory, monkeypatch):
+def mock_patch_stage(tmp_path_factory: pytest.TempPathFactory, monkeypatch):
     # Don't disrupt the spack install directory with tests.
-    mock_path = str(tmpdir_factory.mktemp("mock-patch-stage"))
+    mock_path = str(tmp_path_factory.mktemp("mock-patch-stage"))
     monkeypatch.setattr(spack.stage, "_stage_root", mock_path)
     return mock_path
 
@@ -86,10 +90,10 @@ data_path = os.path.join(spack.paths.test_path, "data", "patch")
         (os.path.join(data_path, "foo.patch"), platform_url_sha, None),
     ],
 )
-def test_url_patch(mock_patch_stage, filename, sha256, archive_sha256, config):
+def test_url_patch(mock_packages, mock_patch_stage, filename, sha256, archive_sha256, config):
     # Make a patch object
     url = url_util.path_to_file_url(filename)
-    s = Spec("patch").concretized()
+    s = spack.concretize.concretize_one("patch")
 
     # make a stage
     with Stage(url) as stage:  # TODO: url isn't used; maybe refactor Stage
@@ -98,7 +102,7 @@ def test_url_patch(mock_patch_stage, filename, sha256, archive_sha256, config):
         mkdirp(stage.source_path)
         with working_dir(stage.source_path):
             # write a file to be patched
-            with open("foo.txt", "w") as f:
+            with open("foo.txt", "w", encoding="utf-8") as f:
                 f.write(
                     """\
 first line
@@ -108,7 +112,7 @@ second line
             # save it for later comparison
             shutil.copyfile("foo.txt", "foo-original.txt")
             # write the expected result of patching.
-            with open("foo-expected.txt", "w") as f:
+            with open("foo-expected.txt", "w", encoding="utf-8") as f:
                 f.write(
                     """\
 zeroth line
@@ -118,11 +122,18 @@ third line
                 )
         # apply the patch and compare files
         patch = spack.patch.UrlPatch(s.package, url, sha256=sha256, archive_sha256=archive_sha256)
-        with patch.stage:
-            patch.stage.create()
-            patch.stage.fetch()
-            patch.stage.expand_archive()
-            patch.apply(stage)
+        patch_stage = Stage(patch.fetcher())
+        with patch_stage:
+            patch_stage.create()
+            patch_stage.fetch()
+            patch_stage.expand_archive()
+            spack.patch.apply_patch(
+                stage.source_path,
+                patch_stage.single_file,
+                patch.level,
+                patch.working_dir,
+                patch.reverse,
+            )
 
         with working_dir(stage.source_path):
             assert filecmp.cmp("foo.txt", "foo-expected.txt")
@@ -131,11 +142,18 @@ third line
         patch = spack.patch.UrlPatch(
             s.package, url, sha256=sha256, archive_sha256=archive_sha256, reverse=True
         )
-        with patch.stage:
-            patch.stage.create()
-            patch.stage.fetch()
-            patch.stage.expand_archive()
-            patch.apply(stage)
+        patch_stage = Stage(patch.fetcher())
+        with patch_stage:
+            patch_stage.create()
+            patch_stage.fetch()
+            patch_stage.expand_archive()
+            spack.patch.apply_patch(
+                stage.source_path,
+                patch_stage.single_file,
+                patch.level,
+                patch.working_dir,
+                patch.reverse,
+            )
 
         with working_dir(stage.source_path):
             assert filecmp.cmp("foo.txt", "foo-original.txt")
@@ -143,8 +161,7 @@ third line
 
 def test_patch_in_spec(mock_packages, config):
     """Test whether patches in a package appear in the spec."""
-    spec = Spec("patch")
-    spec.concretize()
+    spec = spack.concretize.concretize_one("patch")
     assert "patches" in list(spec.variants.keys())
 
     # Here the order is bar, foo, baz. Note that MV variants order
@@ -157,23 +174,47 @@ def test_patch_in_spec(mock_packages, config):
     )
 
 
+def test_stale_patch_cache_falls_back_to_fresh(mock_packages, config):
+    """spec.patches returns correct patches even when the stale in-memory cache is wrong."""
+    spec = spack.concretize.concretize_one("patch@=1.0")
+    pkg_cls = spack.repo.PATH.get_pkg_class("patch")
+
+    # Inject a stale PatchCache: foo_sha256 points to a non-existent patch file
+    stale_cache = spack.patch.PatchCache(repository=spack.repo.PATH)
+    stale_cache.index = {
+        foo_sha256: {
+            pkg_cls.fullname: {
+                "owner": pkg_cls.fullname,
+                "relative_path": "stale_wrong.patch",
+                "level": 1,
+                "working_dir": ".",
+                "reverse": False,
+            }
+        }
+    }
+    spack.repo.PATH._patch_index = stale_cache
+    spack.repo.PATH._index_is_fresh = False
+
+    patches = spec.patches
+
+    assert len(patches) == 2
+    assert {p.relative_path for p in patches} == {"foo.patch", "baz.patch"}
+
+
 def test_patch_mixed_versions_subset_constraint(mock_packages, config):
     """If we have a package with mixed x.y and x.y.z versions, make sure that
     a patch applied to a version range of x.y.z versions is not applied to
     an x.y version.
     """
-    spec1 = Spec("patch@1.0.1")
-    spec1.concretize()
+    spec1 = spack.concretize.concretize_one("patch@1.0.1")
     assert biz_sha256 in spec1.variants["patches"].value
 
-    spec2 = Spec("patch@=1.0")
-    spec2.concretize()
+    spec2 = spack.concretize.concretize_one("patch@=1.0")
     assert biz_sha256 not in spec2.variants["patches"].value
 
 
 def test_patch_order(mock_packages, config):
-    spec = Spec("dep-diamond-patch-top")
-    spec.concretize()
+    spec = spack.concretize.concretize_one("dep-diamond-patch-top")
 
     mid2_sha256 = (
         "mid21234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234"
@@ -207,32 +248,48 @@ def test_nested_directives(mock_packages):
     """Ensure pkg data structures are set up properly by nested directives."""
     # this ensures that the patch() directive results were removed
     # properly from the DirectiveMeta._directives_to_be_executed list
-    patcher = spack.repo.PATH.get_pkg_class("patch-several-dependencies")
-    assert len(patcher.patches) == 0
+    package = spack.repo.PATH.get_pkg_class("patch-several-dependencies")
+    assert len(package.patches) == 0
 
     # this ensures that results of dependency patches were properly added
     # to Dependency objects.
-    deps_by_name = patcher.dependencies_by_name()
 
-    libelf_dep = deps_by_name["libelf"][0]
-    assert len(libelf_dep.patches) == 1
-    assert len(libelf_dep.patches[Spec()]) == 1
+    # package.dependencies is keyed by three when clauses
+    assert package.dependencies.keys() == {Spec(), Spec("+foo"), Spec("@1.0")}
 
-    libdwarf_dep = deps_by_name["libdwarf"][0]
-    assert len(libdwarf_dep.patches) == 2
-    assert len(libdwarf_dep.patches[Spec()]) == 1
-    assert len(libdwarf_dep.patches[Spec("@20111030")]) == 1
+    # fake and libelf are unconditional dependencies
+    when_unconditional = package.dependencies[Spec()]
+    assert when_unconditional.keys() == {"fake", "libelf"}
+    # fake has two unconditional URL patches
+    assert when_unconditional["fake"].patches.keys() == {Spec()}
+    assert len(when_unconditional["fake"].patches[Spec()]) == 2
+    # libelf has one unconditional patch
+    assert when_unconditional["libelf"].patches.keys() == {Spec()}
+    assert len(when_unconditional["libelf"].patches[Spec()]) == 1
 
-    fake_dep = deps_by_name["fake"][0]
-    assert len(fake_dep.patches) == 1
-    assert len(fake_dep.patches[Spec()]) == 2
+    # there are multiple depends_on directives for libelf under the +foo when clause; these must be
+    # reduced to a single Dependency object.
+    when_foo = package.dependencies[Spec("+foo")]
+    assert when_foo.keys() == {"libelf"}
+    assert when_foo["libelf"].spec == Spec("libelf@0.8.10")
+    assert when_foo["libelf"].depflag == dt.BUILD | dt.LINK
+    # there is one unconditional patch for libelf under the +foo when clause
+    assert len(when_foo["libelf"].patches) == 1
+    assert len(when_foo["libelf"].patches[Spec()]) == 1
+
+    # libdwarf is a dependency when @1.0 with two patches applied from a single depends_on
+    # statement, one conditional on the libdwarf version
+    when_1_0 = package.dependencies[Spec("@1.0")]
+    assert when_1_0.keys() == {"libdwarf"}
+    assert when_1_0["libdwarf"].patches.keys() == {Spec(), Spec("@20111030")}
+    assert len(when_1_0["libdwarf"].patches[Spec()]) == 1
+    assert len(when_1_0["libdwarf"].patches[Spec("@20111030")]) == 1
 
 
 @pytest.mark.not_on_windows("Test requires Autotools")
-def test_patched_dependency(mock_packages, config, install_mockery, mock_fetch):
+def test_patched_dependency(mock_packages, install_mockery, mock_fetch):
     """Test whether patched dependencies work."""
-    spec = Spec("patch-a-dependency")
-    spec.concretize()
+    spec = spack.concretize.concretize_one("patch-a-dependency")
     assert "patches" in list(spec["libelf"].variants.keys())
 
     # make sure the patch makes it into the dependency spec
@@ -255,7 +312,7 @@ def test_patched_dependency(mock_packages, config, install_mockery, mock_fetch):
             configure()
 
             # Make sure the Makefile contains the patched text
-            with open("Makefile") as mf:
+            with open("Makefile", encoding="utf-8") as mf:
                 assert "Patched!" in mf.read()
 
 
@@ -268,15 +325,11 @@ def trigger_bad_patch(pkg):
 
 
 def test_patch_failure_develop_spec_exits_gracefully(
-    mock_packages, config, install_mockery, mock_fetch, tmpdir, mock_stage
+    mock_packages, install_mockery, mock_fetch, tmp_path: pathlib.Path, mock_stage
 ):
-    """
-    ensure that a failing patch does not trigger exceptions
-    for develop specs
-    """
+    """ensure that a failing patch does not trigger exceptions for develop specs"""
 
-    spec = Spec("patch-a-dependency " "^libelf dev_path=%s" % str(tmpdir))
-    spec.concretize()
+    spec = spack.concretize.concretize_one(f"patch-a-dependency ^libelf dev_path={tmp_path}")
     libelf = spec["libelf"]
     assert "patches" in list(libelf.variants.keys())
     pkg = libelf.package
@@ -287,13 +340,12 @@ def test_patch_failure_develop_spec_exits_gracefully(
     # success if no exceptions raised
 
 
-def test_patch_failure_restages(mock_packages, config, install_mockery, mock_fetch):
+def test_patch_failure_restages(mock_packages, install_mockery, mock_fetch):
     """
     ensure that a failing patch does not trigger exceptions
     for non-develop specs and the source gets restaged
     """
-    spec = Spec("patch-a-dependency")
-    spec.concretize()
+    spec = spack.concretize.concretize_one("patch-a-dependency")
     pkg = spec["libelf"].package
     with pkg.stage:
         bad_patch_indicator = trigger_bad_patch(pkg)
@@ -304,8 +356,7 @@ def test_patch_failure_restages(mock_packages, config, install_mockery, mock_fet
 
 def test_multiple_patched_dependencies(mock_packages, config):
     """Test whether multiple patched dependencies work."""
-    spec = Spec("patch-several-dependencies")
-    spec.concretize()
+    spec = spack.concretize.concretize_one("patch-several-dependencies")
 
     # basic patch on libelf
     assert "patches" in list(spec["libelf"].variants.keys())
@@ -320,8 +371,7 @@ def test_multiple_patched_dependencies(mock_packages, config):
 
 def test_conditional_patched_dependencies(mock_packages, config):
     """Test whether conditional patched dependencies work."""
-    spec = Spec("patch-several-dependencies @1.0")
-    spec.concretize()
+    spec = spack.concretize.concretize_one("patch-several-dependencies @1.0")
 
     # basic patch on libelf
     assert "patches" in list(spec["libelf"].variants.keys())
@@ -369,11 +419,11 @@ def check_multi_dependency_patch_specs(
     assert foo_patch.path == os.path.join(package_dir, "foo.patch")
     assert foo_patch.sha256 == foo_sha256
 
-    assert bar_patch.owner == "builtin.mock.patch-several-dependencies"
+    assert bar_patch.owner == "builtin_mock.patch-several-dependencies"
     assert bar_patch.path == os.path.join(package_dir, "bar.patch")
     assert bar_patch.sha256 == bar_sha256
 
-    assert baz_patch.owner == "builtin.mock.patch-several-dependencies"
+    assert baz_patch.owner == "builtin_mock.patch-several-dependencies"
     assert baz_patch.path == os.path.join(package_dir, "baz.patch")
     assert baz_patch.sha256 == baz_sha256
 
@@ -385,11 +435,11 @@ def check_multi_dependency_patch_specs(
     url1_patch = get_patch(fake, "urlpatch.patch")
     url2_patch = get_patch(fake, "urlpatch2.patch.gz")
 
-    assert url1_patch.owner == "builtin.mock.patch-several-dependencies"
+    assert url1_patch.owner == "builtin_mock.patch-several-dependencies"
     assert url1_patch.url == "http://example.com/urlpatch.patch"
     assert url1_patch.sha256 == url1_sha256
 
-    assert url2_patch.owner == "builtin.mock.patch-several-dependencies"
+    assert url2_patch.owner == "builtin_mock.patch-several-dependencies"
     assert url2_patch.url == "http://example.com/urlpatch2.patch.gz"
     assert url2_patch.sha256 == url2_sha256
     assert url2_patch.archive_sha256 == url2_archive_sha256
@@ -397,15 +447,16 @@ def check_multi_dependency_patch_specs(
 
 def test_conditional_patched_deps_with_conditions(mock_packages, config):
     """Test whether conditional patched dependencies with conditions work."""
-    spec = Spec("patch-several-dependencies @1.0 ^libdwarf@20111030")
-    spec.concretize()
+    spec = spack.concretize.concretize_one(
+        Spec("patch-several-dependencies @1.0 ^libdwarf@20111030")
+    )
 
     libelf = spec["libelf"]
     libdwarf = spec["libdwarf"]
     fake = spec["fake"]
 
     check_multi_dependency_patch_specs(
-        libelf, libdwarf, fake, "builtin.mock.patch-several-dependencies", spec.package.package_dir
+        libelf, libdwarf, fake, "builtin_mock.patch-several-dependencies", spec.package.package_dir
     )
 
 
@@ -413,8 +464,9 @@ def test_write_and_read_sub_dags_with_patched_deps(mock_packages, config):
     """Test whether patched dependencies are still correct after writing and
     reading a sub-DAG of a concretized Spec.
     """
-    spec = Spec("patch-several-dependencies @1.0 ^libdwarf@20111030")
-    spec.concretize()
+    spec = spack.concretize.concretize_one(
+        Spec("patch-several-dependencies @1.0 ^libdwarf@20111030")
+    )
 
     # write to YAML and read back in -- new specs will *only* contain
     # their sub-DAGs, and won't contain the dependent that patched them
@@ -424,7 +476,7 @@ def test_write_and_read_sub_dags_with_patched_deps(mock_packages, config):
 
     # make sure we can still read patches correctly for these specs
     check_multi_dependency_patch_specs(
-        libelf, libdwarf, fake, "builtin.mock.patch-several-dependencies", spec.package.package_dir
+        libelf, libdwarf, fake, "builtin_mock.patch-several-dependencies", spec.package.package_dir
     )
 
 
@@ -437,8 +489,8 @@ def test_patch_no_file():
 
     patch = spack.patch.Patch(fp, "nonexistent_file", 0, "")
     patch.path = "test"
-    with pytest.raises(spack.patch.NoSuchPatchError, match="No such patch:"):
-        patch.apply("")
+    with pytest.raises(spack.error.NoSuchPatchError, match="No such patch:"):
+        spack.patch.apply_patch(Stage("https://example.com/foo.patch").source_path, patch.path)
 
 
 def test_patch_no_sha256():
@@ -447,10 +499,10 @@ def test_patch_no_sha256():
     fp = FakePackage("fake-package", "test", "fake-package")
     url = url_util.path_to_file_url("foo.tgz")
     match = "Compressed patches require 'archive_sha256' and patch 'sha256' attributes: file://"
-    with pytest.raises(spack.patch.PatchDirectiveError, match=match):
+    with pytest.raises(spack.error.PatchDirectiveError, match=match):
         spack.patch.UrlPatch(fp, url, sha256="", archive_sha256="")
     match = "URL patches require a sha256 checksum"
-    with pytest.raises(spack.patch.PatchDirectiveError, match=match):
+    with pytest.raises(spack.error.PatchDirectiveError, match=match):
         spack.patch.UrlPatch(fp, url, sha256="", archive_sha256="abc")
 
 
@@ -473,9 +525,9 @@ def test_equality():
     assert patch1 != "not a patch"
 
 
-def test_sha256_setter(mock_patch_stage, config):
+def test_sha256_setter(mock_packages, mock_patch_stage, config):
     path = os.path.join(data_path, "foo.patch")
-    s = Spec("patch").concretized()
+    s = spack.concretize.concretize_one("patch")
     patch = spack.patch.FilePatch(s.package, path, level=1, working_dir=".")
     patch.sha256 = "abc"
 
@@ -483,11 +535,11 @@ def test_sha256_setter(mock_patch_stage, config):
 def test_invalid_from_dict(mock_packages, config):
     dictionary = {}
     with pytest.raises(ValueError, match="Invalid patch dictionary:"):
-        spack.patch.from_dict(dictionary)
+        spack.patch.from_dict(dictionary, mock_packages)
 
     dictionary = {"owner": "patch"}
     with pytest.raises(ValueError, match="Invalid patch dictionary:"):
-        spack.patch.from_dict(dictionary)
+        spack.patch.from_dict(dictionary, mock_packages)
 
     dictionary = {
         "owner": "patch",
@@ -498,4 +550,4 @@ def test_invalid_from_dict(mock_packages, config):
         "sha256": bar_sha256,
     }
     with pytest.raises(spack.fetch_strategy.ChecksumError, match="sha256 checksum failed for"):
-        spack.patch.from_dict(dictionary)
+        spack.patch.from_dict(dictionary, mock_packages)

@@ -1,5 +1,4 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 from typing import Any, Dict
@@ -8,20 +7,27 @@ properties: Dict[str, Any] = {
     "develop": {
         "type": "object",
         "default": {},
-        "additionalProperties": False,
-        "patternProperties": {
-            r"\w[\w-]*": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {"spec": {"type": "string"}, "path": {"type": "string"}},
-            }
+        "description": "Configuration for local development of Spack packages",
+        "additionalProperties": {
+            "type": "object",
+            "additionalProperties": False,
+            "description": "Name of a package to develop, with its spec and optional "
+            "source path",
+            "required": ["spec"],
+            "properties": {
+                "spec": {
+                    "type": "string",
+                    "description": "Spec of the package to develop, e.g. hdf5@1.12.0",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Path to the source code for this package, can be "
+                    "absolute or relative to the environment directory",
+                },
+            },
         },
     }
 }
-
-
-def update(data):
-    return False
 
 
 #: Full schema with metadata

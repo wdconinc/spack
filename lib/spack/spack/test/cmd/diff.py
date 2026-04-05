@@ -1,129 +1,46 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
+
+import os
 
 import pytest
 
 import spack.cmd.diff
-import spack.config
+import spack.concretize
 import spack.main
-import spack.store
+import spack.paths
+import spack.repo
 import spack.util.spack_json as sjson
-from spack.test.conftest import create_test_repo
+import spack.version
 
 install_cmd = spack.main.SpackCommand("install")
 diff_cmd = spack.main.SpackCommand("diff")
 find_cmd = spack.main.SpackCommand("find")
 
-
-_p1 = (
-    "p1",
-    """\
-class P1(Package):
-    version("1.0")
-
-    variant("p1var", default=True)
-    variant("usev1", default=True)
-
-    depends_on("p2")
-    depends_on("v1", when="+usev1")
-""",
-)
-
-
-_p2 = (
-    "p2",
-    """\
-class P2(Package):
-    version("1.0")
-
-    variant("p2var", default=True)
-
-    depends_on("p3")
-""",
-)
-
-
-_p3 = (
-    "p3",
-    """\
-class P3(Package):
-    version("1.0")
-
-    variant("p3var", default=True)
-""",
-)
-
-_i1 = (
-    "i1",
-    """\
-class I1(Package):
-    version("1.0")
-
-    provides("v1")
-
-    variant("i1var", default=True)
-
-    depends_on("p3")
-    depends_on("p4")
-""",
-)
-
-_i2 = (
-    "i2",
-    """\
-class I2(Package):
-    version("1.0")
-
-    provides("v1")
-
-    variant("i2var", default=True)
-
-    depends_on("p3")
-    depends_on("p4")
-""",
-)
-
-
-_p4 = (
-    "p4",
-    """\
-class P4(Package):
-    version("1.0")
-
-    variant("p4var", default=True)
-""",
-)
-
-
 # Note that the hash of p1 will differ depending on the variant chosen
 # we probably always want to omit that from diffs
-@pytest.fixture
-def _create_test_repo(tmpdir, mutable_config):
-    """
-    p1____
-    |     \
-    p2     v1
-    | ____/ |
-    p3      p4
+# p1____
+# |     \
+# p2     v1
+# | ____/ |
+# p3      p4
 
-    i1 and i2 provide v1 (and both have the same dependencies)
+# i1 and i2 provide v1 (and both have the same dependencies)
 
-    All packages have an associated variant
-    """
-    yield create_test_repo(tmpdir, [_p1, _p2, _p3, _i1, _i2, _p4])
+# All packages have an associated variant
 
 
 @pytest.fixture
-def test_repo(_create_test_repo, monkeypatch, mock_stage):
-    with spack.repo.use_repositories(_create_test_repo) as mock_repo_path:
-        yield mock_repo_path
+def test_repo(config):
+    builder_test_path = os.path.join(spack.paths.test_repos_path, "spack_repo", "diff")
+    with spack.repo.use_repositories(builder_test_path) as mock_repo:
+        yield mock_repo
 
 
 def test_diff_ignore(test_repo):
-    specA = spack.spec.Spec("p1+usev1").concretized()
-    specB = spack.spec.Spec("p1~usev1").concretized()
+    specA = spack.concretize.concretize_one("p1+usev1")
+    specB = spack.concretize.concretize_one("p1~usev1")
 
     c1 = spack.cmd.diff.compare_specs(specA, specB, to_string=False)
 
@@ -143,8 +60,8 @@ def test_diff_ignore(test_repo):
 
     # Check ignoring changes on multiple packages
 
-    specA = spack.spec.Spec("p1+usev1 ^p3+p3var").concretized()
-    specA = spack.spec.Spec("p1~usev1 ^p3~p3var").concretized()
+    specA = spack.concretize.concretize_one("p1+usev1 ^p3+p3var")
+    specA = spack.concretize.concretize_one("p1~usev1 ^p3~p3var")
 
     c3 = spack.cmd.diff.compare_specs(specA, specB, to_string=False)
     assert find(c3["a_not_b"], "variant_value", ["p3", "p3var"])
@@ -157,8 +74,8 @@ def test_diff_ignore(test_repo):
 def test_diff_cmd(install_mockery, mock_fetch, mock_archive, mock_packages):
     """Test that we can install two packages and diff them"""
 
-    specA = spack.spec.Spec("mpileaks").concretized()
-    specB = spack.spec.Spec("mpileaks+debug").concretized()
+    specA = spack.concretize.concretize_one("mpileaks")
+    specB = spack.concretize.concretize_one("mpileaks+debug")
 
     # Specs should be the same as themselves
     c = spack.cmd.diff.compare_specs(specA, specA, to_string=True)
@@ -168,7 +85,7 @@ def test_diff_cmd(install_mockery, mock_fetch, mock_archive, mock_packages):
     # Calculate the comparison (c)
     c = spack.cmd.diff.compare_specs(specA, specB, to_string=True)
 
-    # these particular diffs should have the same length b/c thre aren't
+    # these particular diffs should have the same length b/c there aren't
     # any node differences -- just value differences.
     assert len(c["a_not_b"]) == len(c["b_not_a"])
 
@@ -181,10 +98,21 @@ def test_diff_cmd(install_mockery, mock_fetch, mock_archive, mock_packages):
     assert ["hash", "mpileaks %s" % specB.dag_hash()] in c["b_not_a"]
 
 
-@pytest.mark.not_on_windows("Not supported on Windows (yet)")
+def test_diff_runtimes(install_mockery, mock_fetch, mock_archive, mock_packages):
+    """Test that we can install two packages and diff them"""
+
+    specA = spack.concretize.concretize_one("mpileaks")
+    specB = specA.copy()
+    specB["gcc-runtime"].versions = spack.version.VersionList([spack.version.Version("0.0.0")])
+
+    # Specs should be the same as themselves
+    c = spack.cmd.diff.compare_specs(specA, specB, to_string=True)
+    assert ["version", "gcc-runtime 0.0.0"] in c["b_not_a"]
+
+
 def test_load_first(install_mockery, mock_fetch, mock_archive, mock_packages):
     """Test with and without the --first option"""
-    install_cmd("mpileaks")
+    install_cmd("--fake", "mpileaks")
 
     # Only one version of mpileaks will work
     diff_cmd("mpileaks", "mpileaks")
@@ -212,15 +140,14 @@ def test_load_first(install_mockery, mock_fetch, mock_archive, mock_packages):
         ["node", dep] in result["intersect"]
         for dep in ("mpileaks", "callpath", "dyninst", "libelf", "libdwarf", "mpich")
     )
+
     assert all(
-        len([diff for diff in result["intersect"] if diff[0] == attr]) == 6
+        len([diff for diff in result["intersect"] if diff[0] == attr]) == 9
         for attr in (
             "version",
             "node_target",
             "node_platform",
             "node_os",
-            "node_compiler",
-            "node_compiler_version",
             "node",
             "package_hash",
             "hash",

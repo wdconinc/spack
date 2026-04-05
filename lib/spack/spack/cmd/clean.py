@@ -1,5 +1,4 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
@@ -7,14 +6,11 @@ import argparse
 import os
 import shutil
 
-import llnl.util.filesystem
-import llnl.util.tty as tty
-
-import spack.bootstrap
 import spack.caches
-import spack.cmd.test
+import spack.cmd
 import spack.config
-import spack.repo
+import spack.llnl.util.filesystem
+import spack.llnl.util.tty as tty
 import spack.stage
 import spack.store
 import spack.util.path
@@ -27,13 +23,13 @@ level = "long"
 
 
 class AllClean(argparse.Action):
-    """Activates flags -s -d -f -m and -p simultaneously"""
+    """Activates flags -s -d -f -m -p and -b simultaneously"""
 
     def __call__(self, parser, namespace, values, option_string=None):
-        parser.parse_args(["-sdfmp"], namespace=namespace)
+        parser.parse_args(["-sdfmpb"], namespace=namespace)
 
 
-def setup_parser(subparser):
+def setup_parser(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument(
         "-s", "--stage", action="store_true", help="remove all temporary build stages (default)"
     )
@@ -65,11 +61,7 @@ def setup_parser(subparser):
         help="remove software and configuration needed to bootstrap Spack",
     )
     subparser.add_argument(
-        "-a",
-        "--all",
-        action=AllClean,
-        help="equivalent to -sdfmp (does not include --bootstrap)",
-        nargs=0,
+        "-a", "--all", action=AllClean, help="equivalent to ``-sdfmpb``", nargs=0
     )
     arguments.add_common_arguments(subparser, ["specs"])
 
@@ -106,7 +98,9 @@ def clean(parser, args):
 
     # Then do the cleaning falling through the cases
     if args.specs:
-        specs = spack.cmd.parse_specs(args.specs, concretize=True)
+        specs = spack.cmd.parse_specs(args.specs, concretize=False)
+        specs = spack.cmd.matching_specs_from_env(specs)
+
         for spec in specs:
             msg = "Cleaning build stage [{0}]"
             tty.msg(msg.format(spec.short_spec))
@@ -136,4 +130,4 @@ def clean(parser, args):
         bootstrap_prefix = spack.util.path.canonicalize_path(spack.config.get("bootstrap:root"))
         msg = 'Removing bootstrapped software and configuration in "{0}"'
         tty.msg(msg.format(bootstrap_prefix))
-        llnl.util.filesystem.remove_directory_contents(bootstrap_prefix)
+        spack.llnl.util.filesystem.remove_directory_contents(bootstrap_prefix)

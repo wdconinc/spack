@@ -1,5 +1,4 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 """Schema for cdash.yaml configuration file.
@@ -14,13 +13,16 @@ properties: Dict[str, Any] = {
     "cdash": {
         "type": "object",
         "additionalProperties": False,
-        # "required": ["build-group", "url", "project", "site"],
         "required": ["build-group"],
-        "patternProperties": {
-            r"build-group": {"type": "string"},
-            r"url": {"type": "string"},
-            r"project": {"type": "string"},
-            r"site": {"type": "string"},
+        "description": "Configuration for uploading build results to CDash",
+        "properties": {
+            "build-group": {
+                "type": "string",
+                "description": "Unique build group name for this stack",
+            },
+            "url": {"type": "string", "description": "CDash server URL"},
+            "project": {"type": "string", "description": "CDash project name"},
+            "site": {"type": "string", "description": "Site identifier for CDash reporting"},
         },
     }
 }

@@ -1,5 +1,4 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 import os
@@ -8,7 +7,6 @@ import sys
 
 import spack.build_environment
 import spack.config
-import spack.error
 import spack.spec
 import spack.util.environment as environment
 from spack import traverse
@@ -18,17 +16,16 @@ from spack.context import Context
 spack_loaded_hashes_var = "SPACK_LOADED_HASHES"
 
 
-def prefix_inspections(platform):
+def prefix_inspections(platform: str) -> dict:
     """Get list of prefix inspections for platform
 
     Arguments:
-        platform (str): the name of the platform to consider. The platform
-            determines what environment variables Spack will use for some
-            inspections.
+        platform: the name of the platform to consider. The platform determines what environment
+            variables Spack will use for some inspections.
 
     Returns:
-        A dictionary mapping subdirectory names to lists of environment
-            variables to modify with that directory if it exists.
+        A dictionary mapping subdirectory names to lists of environment variables to modify with
+        that directory if it exists.
     """
     inspections = spack.config.get("modules:prefix_inspections")
     if isinstance(inspections, dict):
@@ -70,7 +67,9 @@ def project_env_mods(
     *specs: spack.spec.Spec, view, env: environment.EnvironmentModifications
 ) -> None:
     """Given a list of environment modifications, project paths changes to the view."""
-    prefix_to_prefix = {s.prefix: view.get_projection_for_spec(s) for s in specs if not s.external}
+    prefix_to_prefix = {
+        str(s.prefix): view.get_projection_for_spec(s) for s in specs if not s.external
+    }
     # Avoid empty regex if all external
     if not prefix_to_prefix:
         return

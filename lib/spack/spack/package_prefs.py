@@ -1,14 +1,14 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 import stat
 import warnings
 
+import spack.config
 import spack.error
 import spack.repo
-from spack.config import ConfigError
-from spack.util.path import canonicalize_path
+import spack.spec
+from spack.error import ConfigError
 from spack.version import Version
 
 _lesser_spec_types = {"compiler": spack.spec.CompilerSpec, "version": Version}
@@ -22,29 +22,29 @@ def _spec_type(component):
 class PackagePrefs:
     """Defines the sort order for a set of specs.
 
-    Spack's package preference implementation uses PackagePrefss to
+    Spack's package preference implementation uses PackagePrefs to
     define sort order. The PackagePrefs class looks at Spack's
     packages.yaml configuration and, when called on a spec, returns a key
     that can be used to sort that spec in order of the user's
     preferences.
 
-    You can use it like this:
+    You can use it like this::
 
        # key function sorts CompilerSpecs for `mpich` in order of preference
-       kf = PackagePrefs('mpich', 'compiler')
+       kf = PackagePrefs("mpich", "compiler")
        compiler_list.sort(key=kf)
 
-    Or like this:
+    Or like this::
 
        # key function to sort VersionLists for OpenMPI in order of preference.
-       kf = PackagePrefs('openmpi', 'version')
+       kf = PackagePrefs("openmpi", "version")
        version_list.sort(key=kf)
 
     Optionally, you can sort in order of preferred virtual dependency
-    providers.  To do that, provide 'providers' and a third argument
-    denoting the virtual package (e.g., ``mpi``):
+    providers.  To do that, provide ``"providers"`` and a third argument
+    denoting the virtual package (e.g., ``mpi``)::
 
-       kf = PackagePrefs('trilinos', 'providers', 'mpi')
+       kf = PackagePrefs("trilinos", "providers", "mpi")
        provider_spec_list.sort(key=kf)
 
     """
@@ -93,8 +93,10 @@ class PackagePrefs:
         if all:
             pkglist.append("all")
 
+        packages = spack.config.CONFIG.get_config("packages")
+
         for pkg in pkglist:
-            pkg_entry = spack.config.get("packages").get(pkg)
+            pkg_entry = packages.get(pkg)
             if not pkg_entry:
                 continue
 
@@ -137,8 +139,9 @@ class PackagePrefs:
     @classmethod
     def preferred_variants(cls, pkg_name):
         """Return a VariantMap of preferred variants/values for a spec."""
+        packages = spack.config.CONFIG.get_config("packages")
         for pkg_cls in (pkg_name, "all"):
-            variants = spack.config.get("packages").get(pkg_cls, {}).get("variants", "")
+            variants = packages.get(pkg_cls, {}).get("variants", "")
             if variants:
                 break
 
@@ -148,48 +151,12 @@ class PackagePrefs:
 
         # Only return variants that are actually supported by the package
         pkg_cls = spack.repo.PATH.get_pkg_class(pkg_name)
-        spec = spack.spec.Spec("%s %s" % (pkg_name, variants))
-        return dict(
-            (name, variant) for name, variant in spec.variants.items() if name in pkg_cls.variants
-        )
-
-
-def spec_externals(spec):
-    """Return a list of external specs (w/external directory path filled in),
-    one for each known external installation.
-    """
-    # break circular import.
-    from spack.util.module_cmd import path_from_modules  # noqa: F401
-
-    def _package(maybe_abstract_spec):
-        pkg_cls = spack.repo.PATH.get_pkg_class(spec.name)
-        return pkg_cls(maybe_abstract_spec)
-
-    allpkgs = spack.config.get("packages")
-    names = set([spec.name])
-    names |= set(vspec.name for vspec in _package(spec).virtuals_provided)
-
-    external_specs = []
-    for name in names:
-        pkg_config = allpkgs.get(name, {})
-        pkg_externals = pkg_config.get("externals", [])
-        for entry in pkg_externals:
-            spec_str = entry["spec"]
-            external_path = entry.get("prefix", None)
-            if external_path:
-                external_path = canonicalize_path(external_path)
-            external_modules = entry.get("modules", None)
-            external_spec = spack.spec.Spec.from_detection(
-                spack.spec.Spec(
-                    spec_str, external_path=external_path, external_modules=external_modules
-                ),
-                extra_attributes=entry.get("extra_attributes", {}),
-            )
-            if external_spec.intersects(spec):
-                external_specs.append(external_spec)
-
-    # Defensively copy returned specs
-    return [s.copy() for s in external_specs]
+        spec = spack.spec.Spec(f"{pkg_name} {variants}")
+        return {
+            name: variant
+            for name, variant in spec.variants.items()
+            if name in pkg_cls.variant_names()
+        }
 
 
 def is_spec_buildable(spec):

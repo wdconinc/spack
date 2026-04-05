@@ -1,5 +1,4 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
@@ -7,15 +6,14 @@ import argparse
 import sys
 from typing import List
 
-import llnl.util.tty as tty
-
 import spack.cmd
 import spack.cmd.common.confirmation as confirmation
 import spack.environment as ev
+import spack.llnl.util.tty as tty
 import spack.spec
 from spack.cmd.common import arguments
 
-description = "remove specs from the concretized lockfile of an environment"
+description = "remove specs from the lockfile of an environment"
 section = "environments"
 level = "long"
 
@@ -23,7 +21,7 @@ level = "long"
 display_args = {"long": True, "show_flags": False, "variants": False, "indent": 4}
 
 
-def setup_parser(subparser):
+def setup_parser(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument(
         "--root", action="store_true", help="deconcretize only specific environment roots"
     )
@@ -88,7 +86,7 @@ def deconcretize_specs(args, specs):
 
     with env.write_transaction():
         for spec in deconcretize_list:
-            env.deconcretize(spec)
+            env.deconcretize_by_hash(spec.dag_hash())
         env.write()
 
 
@@ -99,5 +97,5 @@ def deconcretize(parser, args):
             " Use `spack deconcretize --all` to deconcretize ALL specs.",
         )
 
-    specs = spack.cmd.parse_specs(args.specs) if args.specs else [any]
+    specs = spack.cmd.parse_specs(args.specs) if args.specs else [None]
     deconcretize_specs(args, specs)

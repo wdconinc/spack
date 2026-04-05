@@ -1,24 +1,23 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
-
 import argparse
-import os.path
+import os
 import textwrap
-
-from llnl.util.lang import stable_partition
+from typing import Any, Optional
 
 import spack.cmd
 import spack.config
 import spack.deptypes as dt
 import spack.environment as ev
-import spack.mirror
-import spack.modules
+import spack.llnl.util.tty as tty
+import spack.mirrors.mirror
+import spack.mirrors.utils
 import spack.reporters
 import spack.spec
 import spack.store
+from spack.llnl.util.lang import stable_partition
 from spack.util.pattern import Args
 
 __all__ = ["add_common_arguments"]
@@ -98,7 +97,7 @@ class ConstraintAction(argparse.Action):
 class SetParallelJobs(argparse.Action):
     """Sets the correct value for parallel build jobs.
 
-    The value is is set in the command line configuration scope so that
+    The value is set in the command line configuration scope so that
     it can be retrieved using the spack.config API.
     """
 
@@ -112,6 +111,57 @@ class SetParallelJobs(argparse.Action):
         spack.config.set("config:build_jobs", jobs, scope="command_line")
 
         setattr(namespace, "jobs", jobs)
+
+
+class SetConcurrentPackages(argparse.Action):
+    """Sets the value for maximum number of concurrent package builds
+
+    The value is set in the command line configuration scope so that
+    it can be retrieved using the spack.config API.
+    """
+
+    def __call__(self, parser, namespace, concurrent_packages, option_string):
+        if concurrent_packages < 1:
+            msg = 'invalid value for argument "{0}" ' '[expected a positive integer, got "{1}"]'
+            raise ValueError(msg.format(option_string, concurrent_packages))
+
+        spack.config.set("config:concurrent_packages", concurrent_packages, scope="command_line")
+
+        setattr(namespace, "concurrent_packages", concurrent_packages)
+
+
+class DeprecatedStoreTrueAction(argparse.Action):
+    """Like the builtin store_true, but prints a deprecation warning."""
+
+    def __init__(
+        self,
+        option_strings,
+        dest: str,
+        default: Optional[Any] = False,
+        required: bool = False,
+        help: Optional[str] = None,
+        removed_in: Optional[str] = None,
+        instructions: Optional[str] = None,
+    ):
+        super().__init__(
+            option_strings=option_strings,
+            dest=dest,
+            nargs=0,
+            const=True,
+            required=required,
+            help=help,
+            default=default,
+        )
+        self.removed_in = removed_in
+        self.instructions = instructions
+
+    def __call__(self, parser, namespace, value, option_string=None):
+        instructions = [] if not self.instructions else [self.instructions]
+        tty.warn(
+            f"{option_string} is deprecated and will be removed in {self.removed_in}.",
+            *instructions,
+        )
+        setattr(namespace, self.dest, self.const)
 
 
 class DeptypeAction(argparse.Action):
@@ -152,6 +202,15 @@ class ConfigScope(argparse.Action):
         setattr(namespace, self.dest, values)
 
 
+def config_scope_readable_validator(value):
+    if value not in spack.config.existing_scope_names():
+        raise ValueError(
+            f"Invalid scope argument {value} "
+            "for config read operation, scope context does not exist"
+        )
+    return value
+
+
 def _cdash_reporter(namespace):
     """Helper function to create a CDash reporter. This function gets an early reference to the
     argparse namespace under construction, so it can later use it to create the object.
@@ -159,6 +218,8 @@ def _cdash_reporter(namespace):
 
     def _factory():
         def installed_specs(args):
+            packages = []
+
             if getattr(args, "spec", ""):
                 packages = args.spec
             elif getattr(args, "specs", ""):
@@ -166,13 +227,8 @@ def _cdash_reporter(namespace):
             elif getattr(args, "package", ""):
                 # Ensure CI 'spack test run' can output CDash results
                 packages = args.package
-            else:
-                packages = []
-                for file in args.specfiles:
-                    with open(file, "r") as f:
-                        s = spack.spec.Spec.from_yaml(f)
-                        packages.append(s.format())
-            return packages
+
+            return [str(spack.spec.Spec(s)) for s in packages]
 
         configuration = spack.reporters.CDashConfiguration(
             upload_url=namespace.cdash_upload_url,
@@ -182,6 +238,7 @@ def _cdash_reporter(namespace):
             buildstamp=namespace.cdash_buildstamp,
             track=namespace.cdash_track,
         )
+
         return spack.reporters.CDash(configuration=configuration)
 
     return _factory
@@ -379,6 +436,18 @@ def jobs():
 
 
 @arg
+def concurrent_packages():
+    return Args(
+        "-p",
+        "--concurrent-packages",
+        action=SetConcurrentPackages,
+        type=int,
+        default=None,
+        help="maximum number of packages to build concurrently",
+    )
+
+
+@arg
 def install_status():
     return Args(
         "-I",
@@ -401,6 +470,16 @@ def no_install_status():
         action="store_false",
         default=True,
         help="do not show install status annotations",
+    )
+
+
+@arg
+def show_non_defaults():
+    return Args(
+        "--non-defaults",
+        action="store_true",
+        default=False,
+        help="highlight non-default versions or variants",
     )
 
 
@@ -505,10 +584,21 @@ class ConfigSetAction(argparse.Action):
     """
 
     def __init__(
-        self, option_strings, dest, const, default=None, required=False, help=None, metavar=None
+        self,
+        option_strings,
+        dest,
+        const,
+        default=None,
+        required=False,
+        help=None,
+        metavar=None,
+        require_environment=False,
     ):
         # save the config option we're supposed to set
         self.config_path = dest
+
+        # save whether the option requires an active env
+        self.require_environment = require_environment
 
         # destination is translated to a legal python identifier by
         # substituting '_' for ':'.
@@ -525,6 +615,11 @@ class ConfigSetAction(argparse.Action):
         )
 
     def __call__(self, parser, namespace, values, option_string):
+        if self.require_environment and not ev.active_environment():
+            raise argparse.ArgumentTypeError(
+                f"argument '{self.option_strings[-1]}' requires an environment"
+            )
+
         # Retrieve the name of the config option and set it to
         # the const from the constructor or a value from the CLI.
         # Note that this is only called if the argument is actually
@@ -546,6 +641,16 @@ def add_concretizer_args(subparser):
     """
     subgroup = subparser.add_argument_group("concretizer arguments")
     subgroup.add_argument(
+        "-f",
+        "--force",
+        action=ConfigSetAction,
+        require_environment=True,
+        dest="concretizer:force",
+        const=True,
+        default=False,
+        help="allow changes to concretized specs in spack.lock (in an env)",
+    )
+    subgroup.add_argument(
         "-U",
         "--fresh",
         action=ConfigSetAction,
@@ -563,12 +668,13 @@ def add_concretizer_args(subparser):
         help="reuse installed packages/buildcaches when possible",
     )
     subgroup.add_argument(
+        "--fresh-roots",
         "--reuse-deps",
         action=ConfigSetAction,
         dest="concretizer:reuse",
         const="dependencies",
         default=None,
-        help="reuse installed dependencies only",
+        help="concretize with fresh roots and reused dependencies",
     )
     subgroup.add_argument(
         "--deprecated",
@@ -581,23 +687,48 @@ def add_concretizer_args(subparser):
 
 
 def add_connection_args(subparser, add_help):
-    subparser.add_argument(
-        "--s3-access-key-id", help="ID string to use to connect to this S3 mirror"
+    def add_argument_string_or_variable(parser, arg: str, *, deprecate_str: bool = True, **kwargs):
+        group = parser.add_mutually_exclusive_group()
+        group.add_argument(arg, **kwargs)
+        # Update help string
+        if "help" in kwargs:
+            kwargs["help"] = "environment variable containing " + kwargs["help"]
+        group.add_argument(arg + "-variable", **kwargs)
+
+    s3_connection_parser = subparser.add_argument_group("S3 Connection")
+
+    add_argument_string_or_variable(
+        s3_connection_parser,
+        "--s3-access-key-id",
+        help="ID string to use to connect to this S3 mirror",
     )
-    subparser.add_argument(
-        "--s3-access-key-secret", help="secret string to use to connect to this S3 mirror"
+    s3_connection_parser.add_argument(
+        "--s3-access-key-secret-variable",
+        help="environment variable containing secret string to use to connect to this S3 mirror",
     )
-    subparser.add_argument(
-        "--s3-access-token", help="access token to use to connect to this S3 mirror"
+    s3_connection_parser.add_argument(
+        "--s3-access-token-variable",
+        help="environment variable containing access token to use to connect to this S3 mirror",
     )
-    subparser.add_argument(
+    s3_connection_parser.add_argument(
         "--s3-profile", help="S3 profile name to use to connect to this S3 mirror", default=None
     )
-    subparser.add_argument(
+    s3_connection_parser.add_argument(
         "--s3-endpoint-url", help="endpoint URL to use to connect to this S3 mirror"
     )
-    subparser.add_argument("--oci-username", help="username to use to connect to this OCI mirror")
-    subparser.add_argument("--oci-password", help="password to use to connect to this OCI mirror")
+
+    oci_connection_parser = subparser.add_argument_group("OCI Connection")
+
+    add_argument_string_or_variable(
+        oci_connection_parser,
+        "--oci-username",
+        deprecate_str=False,
+        help="username to use to connect to this OCI mirror",
+    )
+    oci_connection_parser.add_argument(
+        "--oci-password-variable",
+        help="environment variable containing password to use to connect to this OCI mirror",
+    )
 
 
 def use_buildcache(cli_arg_value):
@@ -660,34 +791,32 @@ def mirror_name_or_url(m):
     # accidentally to a dir in the current working directory.
 
     # If there's a \ or / in the name, it's interpreted as a path or url.
-    if "/" in m or "\\" in m:
-        return spack.mirror.Mirror(m)
+    if "/" in m or "\\" in m or m in (".", ".."):
+        return spack.mirrors.mirror.Mirror(m)
 
     # Otherwise, the named mirror is required to exist.
     try:
-        return spack.mirror.require_mirror_name(m)
+        return spack.mirrors.utils.require_mirror_name(m)
     except ValueError as e:
-        raise argparse.ArgumentTypeError(
-            str(e) + ". Did you mean {}?".format(os.path.join(".", m))
-        )
+        raise argparse.ArgumentTypeError(f"{e}. Did you mean {os.path.join('.', m)}?") from e
 
 
 def mirror_url(url):
     try:
-        return spack.mirror.Mirror.from_url(url)
+        return spack.mirrors.mirror.Mirror.from_url(url)
     except ValueError as e:
-        raise argparse.ArgumentTypeError(str(e))
+        raise argparse.ArgumentTypeError(str(e)) from e
 
 
 def mirror_directory(path):
     try:
-        return spack.mirror.Mirror.from_local_path(path)
+        return spack.mirrors.mirror.Mirror.from_local_path(path)
     except ValueError as e:
-        raise argparse.ArgumentTypeError(str(e))
+        raise argparse.ArgumentTypeError(str(e)) from e
 
 
 def mirror_name(name):
     try:
-        return spack.mirror.require_mirror_name(name)
+        return spack.mirrors.utils.require_mirror_name(name)
     except ValueError as e:
-        raise argparse.ArgumentTypeError(str(e))
+        raise argparse.ArgumentTypeError(str(e)) from e

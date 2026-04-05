@@ -1,5 +1,4 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 import contextlib
@@ -7,8 +6,10 @@ import errno
 import functools
 import os
 import re
+from typing import List
 
 import spack.error
+import spack.llnl.util.filesystem
 import spack.paths
 import spack.util.executable
 import spack.version
@@ -35,7 +36,7 @@ def init(gnupghome=None, force=False):
     When calling any gpg executable, the GNUPGHOME environment
     variable is set to:
 
-    1. The value of the `gnupghome` argument, if not None
+    1. The value of the ``gnupghome`` argument, if not None
     2. The value of the "SPACK_GNUPGHOME" environment variable, if set
     3. The default gpg path for Spack otherwise
 
@@ -60,7 +61,7 @@ def init(gnupghome=None, force=False):
 
     # Set the executable objects for "gpg" and "gpgconf"
     with spack.bootstrap.ensure_bootstrap_configuration():
-        spack.bootstrap.ensure_core_dependencies()
+        spack.bootstrap.ensure_gpg_in_path_or_raise()
         GPG, GPGCONF = _gpg(), _gpgconf()
 
     GPG.add_default_env("GNUPGHOME", GNUPGHOME)
@@ -122,8 +123,8 @@ def gnupghome_override(dir):
     SOCKET_DIR, GNUPGHOME = _SOCKET_DIR, _GNUPGHOME
 
 
-def _parse_secret_keys_output(output):
-    keys = []
+def _parse_secret_keys_output(output: str) -> List[str]:
+    keys: List[str] = []
     found_sec = False
     for line in output.split("\n"):
         if found_sec:
@@ -193,9 +194,10 @@ Expire-Date: %(expires)s
 
 
 @_autoinit
-def signing_keys(*args):
+def signing_keys(*args) -> List[str]:
     """Return the keys that can be used to sign binaries."""
-    output = GPG("--list-secret-keys", "--with-colons", "--fingerprint", *args, output=str)
+    assert GPG
+    output: str = GPG("--list-secret-keys", "--with-colons", "--fingerprint", *args, output=str)
     return _parse_secret_keys_output(output)
 
 
@@ -385,7 +387,7 @@ def _socket_dir(gpgconf):
                 os.mkdir(var_run_user)
                 os.chmod(var_run_user, 0o777)
 
-            user_dir = os.path.join(var_run_user, str(os.getuid()))
+            user_dir = os.path.join(var_run_user, str(spack.llnl.util.filesystem.getuid()))
 
             if not os.path.exists(user_dir):
                 os.mkdir(user_dir)

@@ -1,32 +1,22 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 import hashlib
 import json
 import os
-import time
 import urllib.error
 import urllib.parse
-import urllib.request
-from http.client import HTTPResponse
-from typing import NamedTuple, Tuple
+from typing import List, NamedTuple, Tuple
 from urllib.request import Request
 
-import llnl.util.tty as tty
-
-import spack.binary_distribution
-import spack.config
-import spack.error
 import spack.fetch_strategy
-import spack.mirror
+import spack.llnl.util.tty as tty
+import spack.mirrors.layout
+import spack.mirrors.mirror
 import spack.oci.opener
-import spack.repo
-import spack.spec
 import spack.stage
-import spack.traverse
-import spack.util.crypto
+import spack.util.url
 
 from .image import Digest, ImageReference
 
@@ -35,16 +25,6 @@ class Blob(NamedTuple):
     compressed_digest: Digest
     uncompressed_digest: Digest
     size: int
-
-
-def create_tarball(spec: spack.spec.Spec, tarfile_path):
-    buildinfo = spack.binary_distribution.get_buildinfo_dict(spec)
-    return spack.binary_distribution._do_create_tarball(tarfile_path, spec.prefix, buildinfo)
-
-
-def _log_upload_progress(digest: Digest, size: int, elapsed: float):
-    elapsed = max(elapsed, 0.001)  # guard against division by zero
-    tty.info(f"Uploaded {digest} ({elapsed:.2f}s, {size / elapsed / 1024 / 1024:.2f} MB/s)")
 
 
 def with_query_param(url: str, param: str, value: str) -> str:
@@ -67,6 +47,42 @@ def with_query_param(url: str, param: str, value: str) -> str:
     return urllib.parse.urlunparse(
         parsed._replace(query=urllib.parse.urlencode(query, doseq=True))
     )
+
+
+def list_tags(ref: ImageReference, _urlopen: spack.oci.opener.MaybeOpen = None) -> List[str]:
+    """Retrieves the list of tags associated with an image, handling pagination."""
+    _urlopen = _urlopen or spack.oci.opener.urlopen
+    tags = set()
+    fetch_url = ref.tags_url()
+
+    while True:
+        # Fetch tags
+        request = Request(url=fetch_url)
+        with _urlopen(request) as response:
+            spack.oci.opener.ensure_status(request, response, 200)
+            tags.update(json.load(response)["tags"])
+
+            # Check for pagination
+            link_header = response.headers["Link"]
+
+        if link_header is None:
+            break
+
+        tty.debug(f"OCI tag pagination: {link_header}")
+
+        rel_next_value = spack.util.url.parse_link_rel_next(link_header)
+
+        if rel_next_value is None:
+            break
+
+        rel_next = urllib.parse.urlparse(rel_next_value)
+
+        if rel_next.scheme not in ("https", ""):
+            break
+
+        fetch_url = ref.endpoint(rel_next_value)
+
+    return sorted(tags)
 
 
 def upload_blob(
@@ -104,8 +120,6 @@ def upload_blob(
     if not force and blob_exists(ref, digest, _urlopen):
         return False
 
-    start = time.time()
-
     with open(file, "rb") as f:
         file_size = os.fstat(f.fileno()).st_size
 
@@ -126,21 +140,20 @@ def upload_blob(
                 url=ref.uploads_url(), method="POST", headers={"Content-Length": "0"}
             )
 
-        response = _urlopen(request)
+        with _urlopen(request) as response:
+            # Created the blob in one go.
+            if response.status == 201:
+                return True
 
-        # Created the blob in one go.
-        if response.status == 201:
-            _log_upload_progress(digest, file_size, time.time() - start)
-            return True
+            # Otherwise, do another PUT request.
+            spack.oci.opener.ensure_status(request, response, 202)
+            assert "Location" in response.headers
 
-        # Otherwise, do another PUT request.
-        spack.oci.opener.ensure_status(request, response, 202)
-        assert "Location" in response.headers
+            # Can be absolute or relative, joining handles both
+            upload_url = with_query_param(
+                ref.endpoint(response.headers["Location"]), "digest", str(digest)
+            )
 
-        # Can be absolute or relative, joining handles both
-        upload_url = with_query_param(
-            ref.endpoint(response.headers["Location"]), "digest", str(digest)
-        )
         f.seek(0)
 
         request = Request(
@@ -150,12 +163,9 @@ def upload_blob(
             headers={"Content-Type": "application/octet-stream", "Content-Length": str(file_size)},
         )
 
-        response = _urlopen(request)
+        with _urlopen(request) as response:
+            spack.oci.opener.ensure_status(request, response, 201)
 
-        spack.oci.opener.ensure_status(request, response, 201)
-
-    # print elapsed time and # MB/s
-    _log_upload_progress(digest, file_size, time.time() - start)
     return True
 
 
@@ -193,18 +203,14 @@ def upload_manifest(
         headers={"Content-Type": manifest["mediaType"]},
     )
 
-    response = _urlopen(request)
-
-    spack.oci.opener.ensure_status(request, response, 201)
+    with _urlopen(request) as response:
+        spack.oci.opener.ensure_status(request, response, 201)
     return digest, size
 
 
-def image_from_mirror(mirror: spack.mirror.Mirror) -> ImageReference:
+def image_from_mirror(mirror: spack.mirrors.mirror.Mirror) -> ImageReference:
     """Given an OCI based mirror, extract the URL and image name from it"""
-    url = mirror.push_url
-    if not url.startswith("oci://"):
-        raise ValueError(f"Mirror {mirror} is not an OCI mirror")
-    return ImageReference.from_string(url[6:])
+    return ImageReference.from_url(mirror.push_url)
 
 
 def blob_exists(
@@ -213,8 +219,8 @@ def blob_exists(
     """Checks if a blob exists in an OCI registry"""
     try:
         _urlopen = _urlopen or spack.oci.opener.urlopen
-        response = _urlopen(Request(url=ref.blob_url(digest), method="HEAD"))
-        return response.status == 200
+        with _urlopen(Request(url=ref.blob_url(digest), method="HEAD")) as response:
+            return response.status == 200
     except urllib.error.HTTPError as e:
         if e.getcode() == 404:
             return False
@@ -261,7 +267,7 @@ def copy_missing_layers(
         stages.cache_local()
 
         for stage, digest in zip(stages, missing_digests):
-            # No need to check existince again, force=True.
+            # No need to check existence again, force=True.
             upload_blob(
                 dst, file=stage.save_filename, force=True, digest=digest, _urlopen=_urlopen
             )
@@ -305,34 +311,33 @@ def get_manifest_and_config(
     _urlopen = _urlopen or spack.oci.opener.urlopen
 
     # Get manifest
-    response: HTTPResponse = _urlopen(
+    with _urlopen(
         Request(url=ref.manifest_url(), headers={"Accept": ", ".join(all_content_type)})
-    )
+    ) as response:
+        # Recurse when we find an index
+        if response.headers["Content-Type"] in index_content_type:
+            if recurse == 0:
+                raise Exception("Maximum recursion depth reached while fetching OCI manifest")
 
-    # Recurse when we find an index
-    if response.headers["Content-Type"] in index_content_type:
-        if recurse == 0:
-            raise Exception("Maximum recursion depth reached while fetching OCI manifest")
+            index = json.load(response)
+            manifest_meta = next(
+                manifest
+                for manifest in index["manifests"]
+                if manifest["platform"]["architecture"] == architecture
+            )
 
-        index = json.load(response)
-        manifest_meta = next(
-            manifest
-            for manifest in index["manifests"]
-            if manifest["platform"]["architecture"] == architecture
-        )
+            return get_manifest_and_config(
+                ref.with_digest(manifest_meta["digest"]),
+                architecture=architecture,
+                recurse=recurse - 1,
+                _urlopen=_urlopen,
+            )
 
-        return get_manifest_and_config(
-            ref.with_digest(manifest_meta["digest"]),
-            architecture=architecture,
-            recurse=recurse - 1,
-            _urlopen=_urlopen,
-        )
+        # Otherwise, require a manifest
+        if response.headers["Content-Type"] not in manifest_content_type:
+            raise Exception(f"Unknown content type {response.headers['Content-Type']}")
 
-    # Otherwise, require a manifest
-    if response.headers["Content-Type"] not in manifest_content_type:
-        raise Exception(f"Unknown content type {response.headers['Content-Type']}")
-
-    manifest = json.load(response)
+        manifest = json.load(response)
 
     # Download, verify and cache config file
     config_digest = Digest.from_string(manifest["config"]["digest"])
@@ -364,7 +369,7 @@ def make_stage(
 ) -> spack.stage.Stage:
     _urlopen = _urlopen or spack.oci.opener.urlopen
     fetch_strategy = spack.fetch_strategy.OCIRegistryFetchStrategy(
-        url, checksum=digest.digest, _urlopen=_urlopen
+        url=url, checksum=digest.digest, _urlopen=_urlopen
     )
     # Use blobs/<alg>/<encoded> as the cache path, which follows
     # the OCI Image Layout Specification. What's missing though,
@@ -372,7 +377,7 @@ def make_stage(
     # required by the spec.
     return spack.stage.Stage(
         fetch_strategy,
-        mirror_paths=spack.mirror.OCIImageLayout(digest),
+        mirror_paths=spack.mirrors.layout.OCILayout(digest),
         name=digest.digest,
         keep=keep,
     )

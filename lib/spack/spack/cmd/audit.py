@@ -1,22 +1,21 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
+import argparse
 import warnings
 
-import llnl.util.tty as tty
-import llnl.util.tty.colify
-import llnl.util.tty.color as cl
-
 import spack.audit
+import spack.llnl.util.tty as tty
+import spack.llnl.util.tty.colify
+import spack.llnl.util.tty.color as cl
 import spack.repo
 
 description = "audit configuration files, packages, etc."
-section = "system"
+section = "packaging"
 level = "short"
 
 
-def setup_parser(subparser):
+def setup_parser(subparser: argparse.ArgumentParser) -> None:
     # Top level flags, valid for every audit class
     sp = subparser.add_subparsers(metavar="SUBCOMMAND", dest="subcommand")
 
@@ -80,11 +79,11 @@ def externals(parser, args):
     if args.list_externals:
         msg = "@*{The following packages have detection tests:}"
         tty.msg(cl.colorize(msg))
-        llnl.util.tty.colify.colify(spack.audit.packages_with_detection_tests(), indent=2)
+        spack.llnl.util.tty.colify.colify(spack.audit.packages_with_detection_tests(), indent=2)
         return
 
     pkgs = args.name or spack.repo.PATH.all_package_names()
-    reports = spack.audit.run_group(args.subcommand, pkgs=pkgs)
+    reports = spack.audit.run_group(args.subcommand, pkgs=pkgs, debug_log=tty.debug)
     _process_reports(reports)
 
 
@@ -115,15 +114,11 @@ def audit(parser, args):
 def _process_reports(reports):
     for check, errors in reports:
         if errors:
-            msg = "{0}: {1} issue{2} found".format(
-                check, len(errors), "" if len(errors) == 1 else "s"
-            )
-            header = "@*b{" + msg + "}"
-            print(cl.colorize(header))
+            status = f"{len(errors)} issue{'' if len(errors) == 1 else 's'} found"
+            print(cl.colorize(f"{check}: @*r{{{status}}}"))
+            numdigits = len(str(len(errors)))
             for idx, error in enumerate(errors):
-                print(str(idx + 1) + ". " + str(error))
+                print(f"{idx + 1:>{numdigits}}. {error}")
             raise SystemExit(1)
         else:
-            msg = "{0}: 0 issues found.".format(check)
-            header = "@*b{" + msg + "}"
-            print(cl.colorize(header))
+            print(cl.colorize(f"{check}: @*g{{passed}}"))

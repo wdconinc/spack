@@ -1,5 +1,4 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
@@ -12,7 +11,7 @@ Pop-Location
 Set-Variable -Name python_pf_ver -Value (Get-Command -Name python -ErrorAction SilentlyContinue).Path
 
 # If python_pf_ver is not defined, we cannot find Python on the Path
-# We next look for Spack vendored copys
+# We next look for Spack vendored copies
 if ($null -eq $python_pf_ver)
 {
     $python_pf_ver_list = Resolve-Path -Path "$PWD\Python*"
@@ -60,5 +59,6 @@ function global:prompt
     $pth = $(Convert-Path $(Get-Location)) | Split-Path -leaf
     "[spack] PS $pth>"
 }
+[system.console]::title = "Spack"
 Pop-Location
 

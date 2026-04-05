@@ -1,24 +1,33 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 import copy
 import os
+import pathlib
 import shutil
 
 import pytest
 
-from llnl.util.filesystem import mkdirp, touch, working_dir
-
+import spack.concretize
 import spack.config
+import spack.error
+import spack.fetch_strategy
+import spack.package_base
+import spack.platforms
 import spack.repo
+import spack.util.git
 from spack.fetch_strategy import GitFetchStrategy
+from spack.llnl.util.filesystem import mkdirp, touch, working_dir
+from spack.package_base import PackageBase
 from spack.spec import Spec
 from spack.stage import Stage
+from spack.variant import SingleValuedVariant
 from spack.version import Version
 
 _mock_transport_error = "Mock HTTP transport error"
+min_opt_string = ".".join(map(str, spack.util.git.MIN_OPT_VERSION))
+min_direct_commit = ".".join(map(str, spack.util.git.MIN_DIRECT_COMMIT_FETCH))
 
 
 @pytest.fixture(params=[None, "1.8.5.2", "1.8.5.1", "1.7.10", "1.7.1", "1.7.0"])
@@ -30,7 +39,7 @@ def git_version(git, request, monkeypatch):
     paths for old versions still work, we fake it out here and make it
     use the backward-compatibility code paths with newer git versions.
     """
-    real_git_version = spack.fetch_strategy.GitFetchStrategy.version_from_git(git)
+    real_git_version = Version(spack.util.git.extract_git_version_str(git))
 
     if request.param is None:
         # Don't patch; run with the real git_version method.
@@ -43,31 +52,25 @@ def git_version(git, request, monkeypatch):
         # Patch the fetch strategy to think it's using a lower git version.
         # we use this to test what we'd need to do with older git versions
         # using a newer git installation.
-        monkeypatch.setattr(GitFetchStrategy, "git_version", test_git_version)
+        monkeypatch.setattr(spack.util.git, "extract_git_version_str", lambda _: request.param)
         yield test_git_version
 
 
 @pytest.fixture
-def mock_bad_git(monkeypatch):
+def mock_bad_git(mock_util_executable):
     """
     Test GitFetchStrategy behavior with a bad git command for git >= 1.7.1
     to trigger a SpackError.
     """
 
-    def bad_git(*args, **kwargs):
-        """Raise a SpackError with the transport message."""
-        raise spack.error.SpackError(_mock_transport_error)
-
-    # Patch the fetch strategy to think it's using a git version that
-    # will error out when git is called.
-    monkeypatch.setattr(GitFetchStrategy, "git", bad_git)
-    monkeypatch.setattr(GitFetchStrategy, "git_version", Version("1.7.1"))
-    yield
+    _, should_fail, registered_respones = mock_util_executable
+    should_fail.extend(["clone", "fetch"])
+    registered_respones["--version"] = "1.7.1"
 
 
-def test_bad_git(tmpdir, mock_bad_git):
+def test_bad_git(tmp_path: pathlib.Path, mock_bad_git):
     """Trigger a SpackError when attempt a fetch with a bad git."""
-    testpath = str(tmpdir)
+    testpath = str(tmp_path)
 
     with pytest.raises(spack.error.SpackError):
         fetcher = GitFetchStrategy(git="file:///not-a-real-git-repo")
@@ -108,6 +111,9 @@ def test_fetch(
     # Construct the package under test
     s = default_mock_concretization("git-test")
     monkeypatch.setitem(s.package.versions, Version("git"), t.args)
+
+    if type_of_test == "commit":
+        s.variants["commit"] = SingleValuedVariant("commit", t.args["commit"])
 
     # Enter the stage directory and check some properties
     with s.package.stage:
@@ -175,16 +181,22 @@ def test_fetch_pkg_attr_submodule_init(
 )
 @pytest.mark.disable_clean_stage_check
 def test_adhoc_version_submodules(
-    mock_git_repository, config, mutable_mock_repo, monkeypatch, mock_stage
+    mock_git_repository,
+    config,
+    mutable_mock_repo,
+    monkeypatch,
+    mock_stage,
+    override_git_repos_cache_path,
 ):
     t = mock_git_repository.checks["tag"]
     # Construct the package under test
     pkg_class = spack.repo.PATH.get_pkg_class("git-test")
     monkeypatch.setitem(pkg_class.versions, Version("git"), t.args)
-    monkeypatch.setattr(pkg_class, "git", "file://%s" % mock_git_repository.path, raising=False)
+    monkeypatch.setattr(pkg_class, "git", mock_git_repository.url, raising=False)
 
-    spec = Spec("git-test@{0}".format(mock_git_repository.unversioned_commit))
-    spec.concretize()
+    spec = spack.concretize.concretize_one(
+        Spec("git-test@{0}".format(mock_git_repository.unversioned_commit))
+    )
     spec.package.do_stage()
     collected_fnames = set()
     for root, dirs, files in os.walk(spec.package.stage.source_path):
@@ -212,9 +224,9 @@ def test_debug_fetch(
             assert os.path.isdir(s.package.stage.source_path)
 
 
-def test_git_extra_fetch(git, tmpdir):
+def test_git_extra_fetch(git, tmp_path: pathlib.Path):
     """Ensure a fetch after 'expanding' is effectively a no-op."""
-    testpath = str(tmpdir)
+    testpath = str(tmp_path)
 
     fetcher = GitFetchStrategy(git="file:///not-a-real-git-repo")
     with Stage(fetcher, path=testpath) as stage:
@@ -233,8 +245,10 @@ def test_needs_stage(git):
 
 
 @pytest.mark.parametrize("get_full_repo", [True, False])
+@pytest.mark.parametrize("use_commit", [True, False])
 def test_get_full_repo(
     get_full_repo,
+    use_commit,
     git_version,
     mock_git_repository,
     default_mock_concretization,
@@ -243,18 +257,33 @@ def test_get_full_repo(
 ):
     """Ensure that we can clone a full repository."""
 
-    if git_version < Version("1.7.1"):
+    if git_version < Version(min_opt_string):
         pytest.skip("Not testing get_full_repo for older git {0}".format(git_version))
+
+    # newer git allows for direct commit fetching
+    can_use_direct_commit = git_version >= Version(min_direct_commit)
 
     secure = True
     type_of_test = "tag-branch"
 
     t = mock_git_repository.checks[type_of_test]
 
-    s = default_mock_concretization("git-test")
+    spec_string = "git-test"
+
+    s = default_mock_concretization(spec_string)
+
     args = copy.copy(t.args)
     args["get_full_repo"] = get_full_repo
     monkeypatch.setitem(s.package.versions, Version("git"), args)
+
+    if use_commit:
+        git_exe = mock_git_repository.git_exe
+        url = mock_git_repository.url
+        commit = git_exe("ls-remote", url, t.revision, output=str).strip().split()[0]
+        s.variants["commit"] = SingleValuedVariant("commit", commit)
+        if can_use_direct_commit:
+            path = mock_git_repository.path
+            git_exe("-C", path, "config", "uploadpack.allowReachableSHA1InWant", "true")
 
     with s.package.stage:
         with spack.config.override("config:verify_ssl", secure):
@@ -272,11 +301,27 @@ def test_get_full_repo(
                 ncommits = len(commits)
 
         if get_full_repo:
-            assert nbranches >= 5
-            assert ncommits == 2
+            # default branch commit, plus checkout commit
+            assert ncommits == 2, commits
+            assert nbranches >= 5, branches
         else:
-            assert nbranches == 2
-            assert ncommits == 1
+            assert ncommits == 1, commits
+            if can_use_direct_commit:
+                if use_commit:
+                    # only commit (detached state)
+                    assert nbranches == 1, branches
+                else:
+                    # tag, commit (detached state)
+                    assert nbranches == 2, branches
+            else:
+                if use_commit:
+                    # default branch, tag, commit (detached state)
+                    # git does not have a rewind, avoid messing with git history by
+                    # accepting detachment
+                    assert nbranches == 3, branches
+                else:
+                    # default branch plus tag
+                    assert nbranches == 2, branches
 
 
 @pytest.mark.disable_clean_stage_check
@@ -322,6 +367,7 @@ def test_gitsubmodules_callable(
     """
 
     def submodules_callback(package):
+        assert isinstance(package, PackageBase)
         name = "third_party/submodule0"
         return [name]
 
@@ -374,6 +420,7 @@ def test_gitsubmodules_falsey(
     """
 
     def submodules_callback(package):
+        assert isinstance(package, PackageBase)
         return False
 
     type_of_test = "tag-branch"
@@ -390,3 +437,73 @@ def test_gitsubmodules_falsey(
         assert not os.path.isfile(file_path)
         file_path = os.path.join(s.package.stage.source_path, "third_party/submodule1/r0_file_1")
         assert not os.path.isfile(file_path)
+
+
+@pytest.mark.disable_clean_stage_check
+def test_git_sparse_paths_partial_clone(
+    mock_git_repository, git_version, default_mock_concretization, mutable_mock_repo, monkeypatch
+):
+    """
+    Test partial clone of repository when using git_sparse_paths property
+    """
+    type_of_test = "many-directories"
+    sparse_paths = ["dir0"]
+    omitted_paths = ["dir1", "dir2"]
+    t = mock_git_repository.checks[type_of_test]
+    args = copy.copy(t.args)
+    args["git_sparse_paths"] = sparse_paths
+    s = default_mock_concretization("git-test")
+    monkeypatch.setitem(s.package.versions, Version("git"), args)
+    s.package.do_stage()
+    with working_dir(s.package.stage.source_path):
+        # top level directory files are cloned via sparse-checkout
+        assert os.path.isfile("r0_file")
+
+        for p in sparse_paths:
+            assert os.path.isdir(p)
+
+        if git_version < Version("2.26.0.0"):
+            # older versions of git should fall back to a full clone
+            for p in omitted_paths:
+                assert os.path.isdir(p)
+        else:
+            for p in omitted_paths:
+                assert not os.path.isdir(p)
+
+        # fixture file is in the sparse-path expansion tree
+        assert os.path.isfile(t.file)
+
+
+@pytest.mark.regression("50699")
+def test_git_sparse_path_have_unique_mirror_projections(
+    git, mock_git_repository, mutable_mock_repo, monkeypatch, mutable_config
+):
+    """
+    Confirm two packages with different sparse paths but the same git commit
+    have different mirror projections so tarfiles in the mirror are unique
+    and don't get overwritten
+    """
+    repo_path = mock_git_repository.path
+    monkeypatch.setattr(
+        spack.package_base.PackageBase, "git", pathlib.Path(repo_path).as_uri(), raising=False
+    )
+    gold_commit = git("-C", repo_path, "rev-parse", "many_dirs", output=str).strip()
+    s_a = spack.concretize.concretize_one(f"git-sparse-a commit={gold_commit}")
+    s_b = spack.concretize.concretize_one(f"git-sparse-b commit={gold_commit}")
+    assert s_a.package.stage[0].mirror_layout.path != s_b.package.stage[0].mirror_layout.path
+
+
+@pytest.mark.disable_clean_stage_check
+def test_commit_variant_clone(
+    git, default_mock_concretization, mutable_mock_repo, mock_git_version_info, monkeypatch
+):
+
+    repo_path, filename, commits = mock_git_version_info
+    test_commit = commits[-2]
+    s = default_mock_concretization("git-test")
+    args = {"git": pathlib.Path(repo_path).as_uri()}
+    monkeypatch.setitem(s.package.versions, Version("git"), args)
+    s.variants["commit"] = SingleValuedVariant("commit", test_commit)
+    s.package.do_stage()
+    with working_dir(s.package.stage.source_path):
+        assert git("rev-parse", "HEAD", output=str, error=str).strip() == test_commit

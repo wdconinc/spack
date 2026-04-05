@@ -1,5 +1,4 @@
-# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 import io
@@ -164,7 +163,7 @@ def test_ordered_replacement():
 
     # Finally, make sure that the regex is not greedily finding the LAST null byte
     # it should find the first null byte in the window. In this test we put one null
-    # at a distance where we cant keep a long enough suffix, and one where we can,
+    # at a distance where we can't keep a long enough suffix, and one where we can,
     # so we should expect failure when the first null is used.
     error_msg = "Cannot replace {!r} with {!r} in the C-string {!r}.".format(
         b"pkg-abcdef", b"pkg-xyzabc", b"pkg-abcdef"

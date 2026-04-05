@@ -4,7 +4,7 @@
 {% endif %}
 {% if render_phase.build %}
 # Build stage with Spack pre-installed and ready to be used
-FROM {{ build.image }} as builder
+FROM {{ build.image }} AS builder
 
 {% block build_stage %}
 {% if os_packages_build %}
@@ -49,8 +49,7 @@ FROM {{ run.image }}
 
 COPY --from=builder {{ paths.environment }} {{ paths.environment }}
 COPY --from=builder {{ paths.store }} {{ paths.store }}
-
-# paths.view is a symlink, so copy the parent to avoid dereferencing and duplicating it
+{# paths.view is a symlink, so copy the parent to avoid dereferencing and duplicating it #}
 COPY --from=builder {{ paths.view_parent }} {{ paths.view_parent }}
 
 RUN { \
